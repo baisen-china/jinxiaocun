@@ -2877,6 +2877,87 @@ function inventoryValue() {
   };
 }
 
+// ---------- 收付款流水 ----------
+// 财务页「收付款流水」卡片、打印、导出 Excel 三处共用同一份取数与筛选。
+// 不各写一套的理由和应收应付明细一样：WHERE 条件复制三份，迟早出现
+// 「屏幕上按当天筛过、导出的却是全部」或「日期一个按本地日、一个按 UTC 日」这类差一天的问题。
+const PAY_FLOW_METHODS = { cash: '现金', bank: '银行转账', alipay: '支付宝', wechat: '微信', other: '其他' };
+const PAY_FLOW_MAX_ROWS = 20000;   // 单次导出/打印上限：够覆盖几年流水，又不至于把主线程占满
+
+function paymentsFlowData(q, limit) {
+  const src = q || {};
+  // 日期按「本地日」比较（created_at 存的是本地时间字符串），起止都含端点
+  const from = String(src.pay_from || '').slice(0, 10);
+  const to = String(src.pay_to || '').slice(0, 10);
+  const direction = (src.pay_direction === 'pay' || src.pay_direction === 'receive') ? src.pay_direction : '';
+  const method = Object.prototype.hasOwnProperty.call(PAY_FLOW_METHODS, src.pay_method) ? src.pay_method : '';
+  const operator = String(src.pay_operator || '').trim();
+  // 往来单位用「类型:id」合成一个值，避免前端要传两个参数、其中一个忘传就变成「只看收/只看付」
+  const pm = /^(supplier|customer):(\d+)$/.exec(String(src.pay_party || ''));
+  const partyType = pm ? pm[1] : '';
+  const partyId = pm ? parseInt(pm[2], 10) : 0;
+
+  let where = ' WHERE 1=1';
+  const params = [];
+  if (from) { where += ' AND date(p.created_at) >= date(?)'; params.push(from); }
+  if (to) { where += ' AND date(p.created_at) <= date(?)'; params.push(to); }
+  if (direction) { where += ' AND p.direction = ?'; params.push(direction); }
+  if (method) { where += ' AND p.method = ?'; params.push(method); }
+  if (operator) { where += ' AND p.operator = ?'; params.push(operator); }
+  if (partyType) { where += ' AND p.party_type = ? AND p.party_id = ?'; params.push(partyType, partyId); }
+
+  // 小计按「筛选后的全量」算，不受下面 LIMIT 影响，否则翻页时合计会跟着变
+  const agg = db.prepare(`SELECT COUNT(*) AS c,
+      COALESCE(SUM(CASE WHEN p.direction='pay' THEN p.amount ELSE 0 END),0) AS pay_sum,
+      COALESCE(SUM(CASE WHEN p.direction='receive' THEN p.amount ELSE 0 END),0) AS recv_sum,
+      COALESCE(SUM(CASE WHEN p.is_deposit=1 THEN p.amount ELSE 0 END),0) AS dep_sum
+    FROM payments p${where}`).get(...params);
+
+  const max = Math.max(1, Math.min(PAY_FLOW_MAX_ROWS, parseInt(limit, 10) || 400));
+  const rows = db.prepare(`SELECT p.* FROM payments p${where} ORDER BY p.created_at DESC, p.id DESC LIMIT ?`).all(...params, max);
+
+  // 待审的金额调整：标到对应流水行上，避免同一笔被重复申请/看不清状态
+  const pendAdj = db.prepare("SELECT payment_id, id AS adj_id, new_amount, requested_by, requested_at FROM payment_adjustments WHERE status='pending'").all();
+  const pendMap = {};
+  for (const a of pendAdj) pendMap[a.payment_id] = { adj_id: a.adj_id, new_amount: r2(a.new_amount), requested_by: a.requested_by, requested_at: a.requested_at };
+  const allocMap = allocMapForPayIds(rows.map(p => p.id));
+  const nameMap = partyNameMap();
+  const items = rows.map(p => ({
+    ...p, amount: r2(p.amount),
+    party_name: partyNameOf(nameMap, p.party_type, p.party_id),
+    allocations: allocMap.get(p.id) || [],
+    pending_adjust: pendMap[p.id] || null
+  }));
+
+  return {
+    filter: { from, to, direction, method, operator, party_type: partyType, party_id: partyId },
+    total: agg.c,
+    pay_sum: r2(agg.pay_sum),
+    receive_sum: r2(agg.recv_sum),
+    deposit_sum: r2(agg.dep_sum),
+    net: r2(agg.recv_sum - agg.pay_sum),
+    limit: max,
+    items
+  };
+}
+
+// 筛选条件的可读描述（导出表头 / 打印页眉都用这一句，口径不会走样）
+function payFlowFilterText(q, parties) {
+  const src = q || {};
+  const f = src.filter || src;
+  const partyType = f.party_type || '';
+  const partyId = f.party_id || 0;
+  let partyText = '全部';
+  if (partyType && partyId) {
+    const list = (parties && (partyType === 'supplier' ? parties.suppliers : parties.customers)) || [];
+    const hit = list.find(x => Number(x.id) === Number(partyId));
+    partyText = `${partyType === 'supplier' ? '供应商' : '客户'} · ${hit ? hit.name : ('#' + partyId)}`;
+  }
+  const dirText = f.direction === 'pay' ? '采购付款' : f.direction === 'receive' ? '销售收款' : '全部';
+  return `日期 ${f.from || '不限'} ~ ${f.to || '不限'} ｜ 类型 ${dirText} ｜ 往来单位 ${partyText}`
+    + ` ｜ 方式 ${f.method ? (PAY_FLOW_METHODS[f.method] || f.method) : '全部'} ｜ 操作人 ${f.operator || '全部'}`;
+}
+
 // 财务汇总的计算体：抽成独立函数，供 /api/finance/summary（页面渲染）
 // 与 /api/finance/export（按同一套筛选条件导出 Excel）共用。
 // 为什么不各写一套：筛选条件（p_/s_ 前缀 × 单位/商品/日期/退单/状态）解析起来有十几行，
@@ -3031,17 +3112,12 @@ function financeSummaryData(q, req) {
     if (b > 0.001) { orphanBalance = r2(orphanBalance + b); orphanCount++; }
   }
 
-  // 收付款流水：默认取最近 400 笔，前端可点「加载更多」把上限调大（最多 2000）
+  // 收付款流水：带条件查询（时间段 / 类型 / 往来单位 / 方式 / 操作人）。
+  // 默认取前 400 笔，前端可点「加载更多」把上限调大（最多 2000）。
   const payLimit = Math.min(2000, Math.max(50, parseInt(q.pay_limit, 10) || 400));
-  const payTotal = db.prepare('SELECT COUNT(*) AS c FROM payments').get().c;
-  const payments = db.prepare(`SELECT p.* FROM payments p ORDER BY p.created_at DESC, p.id DESC LIMIT ?`).all(payLimit);
-  // 待审的金额调整：标到对应流水行上，避免同一笔被重复申请/看不清状态
-  const pendAdj = db.prepare("SELECT payment_id, id AS adj_id, new_amount, requested_by, requested_at FROM payment_adjustments WHERE status='pending'").all();
-  const pendMap = {};
-  for (const a of pendAdj) pendMap[a.payment_id] = { adj_id: a.adj_id, new_amount: r2(a.new_amount), requested_by: a.requested_by, requested_at: a.requested_at };
-  const payAllocMap = allocMapForPayIds(payments.map(p => p.id));
-  const payNameMap = partyNameMap();
-  const payOut = payments.map(p => ({ ...p, amount: r2(p.amount), party_name: partyNameOf(payNameMap, p.party_type, p.party_id), allocations: payAllocMap.get(p.id) || [], pending_adjust: pendMap[p.id] || null }));
+  const payFlow = paymentsFlowData(q, payLimit);
+  const payOut = payFlow.items;
+  const payTotal = payFlow.total;
   // 金额调整申请：管理员看全部待审，普通用户只看自己提交的
   const adjSql = `SELECT a.*, p.direction, p.party_type, p.party_id, p.amount AS current_amount, p.note AS pay_note, p.created_at AS pay_at,
       COALESCE((SELECT SUM(amount) FROM payment_allocations WHERE payment_id=p.id),0) AS alloc
@@ -3068,6 +3144,11 @@ function financeSummaryData(q, req) {
     payments: payOut,
     payments_total: payTotal,
     payments_limit: payLimit,
+    // 流水的筛选回显与小计：前端筛选条、卡片标题都用这几个，避免前端再算一遍口径不同
+    payments_filter: payFlow.filter,
+    payments_sum: { pay: payFlow.pay_sum, receive: payFlow.receive_sum, deposit: payFlow.deposit_sum, net: payFlow.net },
+    // 操作人候选：只列真实出现过的操作人，避免下拉里出现空值或拼错的名字
+    payments_operators: db.prepare("SELECT DISTINCT operator FROM payments WHERE operator IS NOT NULL AND operator<>'' ORDER BY operator").all().map(r => r.operator),
     adjustments: adjustments,
     adjustments_pending: adjustments.length,
     suppliers, customers
@@ -3160,6 +3241,66 @@ app.get('/api/finance/export', requireAuth, (req, res) => {
   const fname = `${isPur ? '采购应付明细' : '销售应收明细'}_${stamp}.xlsx`;
   res.setHeader('Content-Type', 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet');
   res.setHeader('Content-Disposition', `attachment; filename="finance_${isPur ? 'payable' : 'receivable'}_${stamp}.xlsx"; filename*=UTF-8''${encodeURIComponent(fname)}`);
+  res.setHeader('Content-Length', buf.length);
+  res.end(buf);
+});
+
+// ---------- 收付款流水：打印取数 / 导出 Excel ----------
+// 打印由前端生成自包含 HTML（能控制纸张、跨页表头、另存 PDF），所以这里只回 JSON；
+// 但取数必须走后端同一个 paymentsFlowData，避免「打印出来的是全部、屏幕上是当天」。
+app.get('/api/finance/payments', requireAuth, (req, res) => {
+  res.json(paymentsFlowData(req.query || {}, PAY_FLOW_MAX_ROWS));
+});
+
+app.get('/api/finance/payments/export', requireAuth, (req, res) => {
+  const d = paymentsFlowData(req.query || {}, PAY_FLOW_MAX_ROWS);
+  if (!d.items.length) return res.status(400).json({ error: '当前筛选条件下没有收付款记录，无法导出' });
+  const parties = {
+    suppliers: db.prepare('SELECT id, name FROM suppliers').all(),
+    customers: db.prepare('SELECT id, name FROM customers').all()
+  };
+  const ftxt = payFlowFilterText(d.filter, parties);
+  const brand = getSettings().branding;
+  const dirText = (p) => (p.is_deposit ? '定金' : (p.direction === 'pay' ? '采购付款' : '销售收款'));
+  const allocText = (p) => (p.allocations || [])
+    .map(a => `${a.doc_no || ((a.doc_type === 'purchase' ? '采购' : '销售') + '#' + a.doc_id)} ${r2(a.amount)}`)
+    .join('；') || '预付款/预收款（未分摊）';
+
+  const rows = [
+    [`${brand.shopName || ''} · 收付款流水`],
+    [ftxt],
+    [`导出时间：${nowLocal()}　｜　共 ${d.total} 笔${d.items.length < d.total ? `（表内为最近 ${d.items.length} 笔）` : ''}`
+      + `　｜　收款合计 ${r2(d.receive_sum)}　｜　付款合计 ${r2(d.pay_sum)}　｜　净额 ${r2(d.net)}`],
+    [],
+    ['时间', '类型', '往来单位', '分摊单据', '金额', '方式', '备注', '操作人']
+  ];
+  for (const p of d.items) {
+    rows.push([
+      (p.created_at || '').replace('T', ' ').slice(0, 19),
+      dirText(p),
+      p.party_name || '',
+      allocText(p),
+      r2(p.amount),
+      PAY_FLOW_METHODS[p.method] || p.method || '',
+      p.note || '',
+      p.operator || ''
+    ]);
+  }
+  // 合计不再按表内行内加总，直接用 SQL 聚合的筛选后全量，表内是最近 N 笔时也不会算少
+  rows.push([]);
+  rows.push(['合计', `${d.total} 笔`, '', '', '', '', '', '']);
+  rows.push(['收款合计', '', '', '', r2(d.receive_sum), '', '', '']);
+  rows.push(['付款合计', '', '', '', r2(d.pay_sum), '', '', '']);
+  rows.push(['净额（收 − 付）', '', '', '', r2(d.net), '', '', '']);
+
+  let buf;
+  try { buf = buildWorkbook([{ name: '收付款流水', rows }]); }
+  catch (e) { return res.status(500).json({ error: '生成 Excel 失败：' + e.message }); }
+
+  const stamp = db.prepare("SELECT strftime('%Y%m%d','now','localtime') AS d").get().d;
+  const fname = `收付款流水_${stamp}.xlsx`;
+  res.setHeader('Content-Type', 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet');
+  res.setHeader('Content-Disposition', `attachment; filename="finance_payments_${stamp}.xlsx"; filename*=UTF-8''${encodeURIComponent(fname)}`);
   res.setHeader('Content-Length', buf.length);
   res.end(buf);
 });

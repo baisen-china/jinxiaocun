@@ -3022,6 +3022,31 @@
   let finSalFilters = null;   // 销售应收 { party, product, from, to, ret, status }
   let finSuppliers = [], finCustomers = [];
   let finPayLimit = 400;   // 收付款流水一次显示多少笔，「加载更多」时递增
+  // 收付款流水的筛选状态：时间段默认「当天」（财务每天最常看的就是今天的收付），
+  // 日期框清空即表示不限 —— 想看全部历史就把两个日期清掉再查，不必另加「全部」开关。
+  let finPayFilters = null;   // { from, to, direction, party, method, operator }
+  let finPayOps = [];          // 操作人候选（后端给真实出现过的名字）
+  function finToday() {
+    const n = new Date();
+    const pad = (x) => String(x).padStart(2, '0');
+    return `${n.getFullYear()}-${pad(n.getMonth() + 1)}-${pad(n.getDate())}`;
+  }
+  function finPayDefault() {
+    return { from: finToday(), to: finToday(), direction: '', party: '', method: '', operator: '' };
+  }
+  const finPay = () => finPayFilters || finPayDefault();
+  // 收付款流水自己的参数（pay_*）：summary 与打印/导出共用这一份，避免两处拼参不同
+  function finPayParams() {
+    const f = finPay();
+    const qs = new URLSearchParams();
+    qs.set('pay_from', f.from || '');
+    qs.set('pay_to', f.to || '');
+    if (f.direction) qs.set('pay_direction', f.direction);
+    if (f.party) qs.set('pay_party', f.party);
+    if (f.method) qs.set('pay_method', f.method);
+    if (f.operator) qs.set('pay_operator', f.operator);
+    return qs;
+  }
   function finMonth() {
     const n = new Date(), y = n.getFullYear(), m = n.getMonth();
     const pad = (x) => String(x).padStart(2, '0');
@@ -3050,6 +3075,7 @@
     if (s.to) qs.set('s_to', s.to);
     qs.set('s_return', s.ret || 'all');
     qs.set('s_status', s.status || 'all');
+    finPayParams().forEach((v, k) => qs.set(k, v));   // 收付款流水的条件一并带上
     if (finPayLimit > 400) qs.set('pay_limit', String(finPayLimit));
     return '?' + qs.toString();
   }
@@ -3080,6 +3106,35 @@
     </div>`;
   }
 
+  // 收付款流水筛选条：时间段（默认当天）/ 类型 / 往来单位 / 方式 / 操作人
+  // 供应商与客户合成一个下拉、值写成「类型:id」，既减少一次选择，也不会出现「选了单位却忘了选类型」
+  function finPayFilterBar() {
+    const f = finPay();
+    const dirOpts = [['', '全部'], ['pay', '采购付款'], ['receive', '销售收款']]
+      .map(([v, t]) => `<option value="${v}" ${f.direction === v ? 'selected' : ''}>${t}</option>`).join('');
+    const partyOpts = [...finSuppliers.map(p => ({ v: `supplier:${p.id}`, t: `供应商 · ${p.name}` })),
+      ...finCustomers.map(p => ({ v: `customer:${p.id}`, t: `客户 · ${p.name}` }))]
+      .sort((a, b) => a.t.localeCompare(b.t, 'zh-CN'))
+      .map(o => `<option value="${o.v}" ${f.party === o.v ? 'selected' : ''}>${esc(o.t)}</option>`).join('');
+    const methodOpts = Object.entries(PAY_METHODS)
+      .map(([v, t]) => `<option value="${v}" ${f.method === v ? 'selected' : ''}>${t}</option>`).join('');
+    const opOpts = finPayOps.map(o => `<option value="${esc(o)}" ${f.operator === o ? 'selected' : ''}>${esc(o)}</option>`).join('');
+    return `<div class="filter-bar">
+      <label>起始<input type="date" id="f-pay-from" value="${f.from || ''}"></label>
+      <label>结束<input type="date" id="f-pay-to" value="${f.to || ''}"></label>
+      <label>类型<select id="f-pay-direction">${dirOpts}</select></label>
+      <label>往来单位<select id="f-pay-party"><option value="">全部单位</option>${partyOpts}</select></label>
+      <label>方式<select id="f-pay-method"><option value="">全部方式</option>${methodOpts}</select></label>
+      <label>操作人<select id="f-pay-operator"><option value="">全部操作人</option>${opOpts}</select></label>
+      <button class="btn-primary small" data-pay-search="1">查询</button>
+      <button class="btn-ghost small" data-pay-reset="1" title="恢复为「仅今天、不限其他条件」">重置(当天)</button>
+      <span class="fin-io">
+        <button class="btn-ghost small" data-pay-print="1" title="按当前筛选条件打印流水（A4 横向，自动重复表头）">打印</button>
+        <button class="btn-ghost small" data-pay-export="1" title="按当前筛选条件导出 Excel">导出 Excel</button>
+      </span>
+    </div>`;
+  }
+
   async function renderFinance() {
     $('#topbar-actions').innerHTML = `<button class="btn-primary" id="add-pay">+ 记收付款</button><button class="btn-ghost" id="open-ledger">收付流水账</button>`;
     const [data, orphans] = await Promise.all([
@@ -3088,7 +3143,10 @@
     ]);
     finSuppliers = data.suppliers || [];
     finCustomers = data.customers || [];
+    finPayOps = data.payments_operators || [];
     const pur = data.purchase, sal = data.sale, adv = data.advances;
+    // 流水小计由后端按「筛选后的全量」算好（不是把页面上这几行加起来），翻页/加载更多时不会变
+    const psum = data.payments_sum || { pay: 0, receive: 0, net: 0 };
     // 挂在账外、不属于任何单位的钱：不进任何一家的预存，也不参与自动抵扣
     const orph = data.orphans || { count: 0, balance: 0 };
     state.cache.__purList = pur.list;
@@ -3214,11 +3272,15 @@
       <div class="card" style="margin-top:16px">
         <div class="card-title">收付款流水
           <span class="tag gray">${data.payments_total || 0} 笔</span>
+          <span class="tag good">收 ${yuan(psum.receive)}</span>
+          <span class="tag warn">付 ${yuan(psum.pay)}</span>
+          <span class="tag ${psum.net >= 0 ? 'ok' : 'muted'}">净 ${yuan(psum.net)}</span>
           <span class="muted" style="font-weight:400;font-size:12px">${state.user.role === 'admin' ? '金额可点「调整金额」修改（立即生效），录错的记录可直接删除' : (perm('userAdjustAmount') ? '金额可点「调整金额」修改（需管理员审批）' : '普通用户的金额调整权限已由管理员关闭')}</span>
         </div>
+        ${finPayFilterBar()}
         <div class="table-wrap">
           <table><thead><tr><th>时间</th><th>类型</th><th>往来单位</th><th>分摊单据</th><th class="num">金额</th><th>方式</th><th>备注</th><th>操作人</th><th>操作</th></tr></thead><tbody>
-            ${data.payments.length ? data.payments.map(p => payRow(p)).join('') : '<tr><td colspan="9" class="empty">暂无收付款记录</td></tr>'}
+            ${data.payments.length ? data.payments.map(p => payRow(p)).join('') : '<tr><td colspan="9" class="empty">当前条件下没有收付款记录（默认只看今天，可改起止日期或清空日期查历史）</td></tr>'}
           </tbody></table>
         </div>
         ${(data.payments_total || 0) > data.payments.length ? `<div class="load-more">
@@ -3312,6 +3374,30 @@
     // 打印 / 导出：都只作用于「当前已查询出的结果」，不会重新按全量取数
     $$('#content [data-print]').forEach(btn => btn.onclick = () => printFinance(btn.dataset.print));
     $$('#content [data-export]').forEach(btn => btn.onclick = () => exportFinance(btn, btn.dataset.export));
+    // 收付款流水：条件查询 / 重置 / 打印 / 导出 / 加载更多
+    const paySearch = $('#content [data-pay-search]');
+    if (paySearch) paySearch.onclick = () => {
+      const from = $('#content #f-pay-from').value;
+      const to = $('#content #f-pay-to').value;
+      if (from && to && from > to) return toast('起始日期不能晚于结束日期', true);
+      finPayFilters = {
+        from, to,
+        direction: $('#content #f-pay-direction').value,
+        party: $('#content #f-pay-party').value,
+        method: $('#content #f-pay-method').value,
+        operator: $('#content #f-pay-operator').value
+      };
+      finPayLimit = 400;   // 条件变了就回到第一屏，避免沿用上次「加载更多」的上限
+      renderFinance();
+    };
+    const payReset = $('#content [data-pay-reset]');
+    if (payReset) payReset.onclick = () => { finPayFilters = null; finPayLimit = 400; renderFinance(); };
+    const payPrint = $('#content [data-pay-print]');
+    if (payPrint) payPrint.onclick = () => printPayFlow(payPrint);
+    const payExport = $('#content [data-pay-export]');
+    if (payExport) payExport.onclick = () => exportPayFlow(payExport);
+    const payMore = $('#pay-more');
+    if (payMore) payMore.onclick = () => { finPayLimit += 400; renderFinance(); };
   }
 
   // 付款构成 → 纯文本状态（页面标签、打印、导出口径必须一致）
@@ -3623,8 +3709,97 @@ ${d.note ? `<div class="note">备注：${esc(d.note)}</div>` : ''}
     btn.disabled = false;
   }
 
-  // 退单处理：根据单据状态与当前用户角色，分三种情况处理
-  // - 普通用户：仅能「锁定」申请，等待管理员审批
+  // ---------- 收付款流水：打印 / 导出 ----------
+  // 与页面卡片共用 finPayParams() 这一份筛选参数，杜绝「屏幕上筛的是今天、导出的却是全部」。
+  const payDirText = (p) => (p.is_deposit ? '定金' : (p.direction === 'pay' ? '采购付款' : '销售收款'));
+  const payAllocText = (p) => (p.allocations || [])
+    .map(a => `${a.doc_no || ((a.doc_type === 'purchase' ? '采购' : '销售') + '#' + a.doc_id)} ${yuan(a.amount)}`)
+    .join('，') || '预付款/预收款（未分摊）';
+  // 筛选条件的文字说明：打印页眉、导出文件头都用这一句
+  function payFilterText() {
+    const f = finPay();
+    let partyText = '全部';
+    if (f.party) {
+      const [t, id] = f.party.split(':');
+      const list = t === 'supplier' ? finSuppliers : finCustomers;
+      const hit = (list || []).find(x => String(x.id) === String(id));
+      partyText = `${t === 'supplier' ? '供应商' : '客户'} · ${hit ? hit.name : ('#' + id)}`;
+    }
+    return `日期 ${f.from || '不限'} ~ ${f.to || '不限'} ｜ 类型 ${({ pay: '采购付款', receive: '销售收款' })[f.direction] || '全部'}`
+      + ` ｜ 往来单位 ${partyText} ｜ 方式 ${f.method ? (PAY_METHODS[f.method] || f.method) : '全部'} ｜ 操作人 ${f.operator || '全部'}`;
+  }
+
+  async function printPayFlow(btn) {
+    btn.disabled = true;
+    let d;
+    try { d = await api('GET', '/api/finance/payments?' + finPayParams().toString()); }
+    catch (e) { btn.disabled = false; return toast(e.message, true); }
+    btn.disabled = false;
+    if (!d.items || !d.items.length) return toast('当前条件下没有收付款记录', true);
+
+    const brand = (state.branding && state.branding.shopName) || '';
+    const body = d.items.map(p => `<tr>
+      <td class="nowrap">${esc((p.created_at || '').replace('T', ' ').slice(0, 16))}</td>
+      <td class="nowrap">${esc(payDirText(p))}</td>
+      <td>${esc(p.party_name || '—')}</td>
+      <td class="alloc">${esc(payAllocText(p))}</td>
+      <td class="num">${yuan(p.amount)}</td>
+      <td class="nowrap">${esc(PAY_METHODS[p.method] || p.method || '')}</td>
+      <td>${esc(p.note || '')}</td>
+      <td class="nowrap">${esc(p.operator || '')}</td>
+    </tr>`).join('');
+
+    const html = `<!doctype html><html lang="zh-CN"><head><meta charset="utf-8">
+<title>${esc((brand ? brand + ' · ' : '') + '收付款流水')}</title>
+<style>
+  @page { size: A4 landscape; margin: 10mm; }
+  * { box-sizing: border-box; }
+  body { font-family: "Microsoft YaHei","PingFang SC","Hiragino Sans GB",sans-serif; color:#111; font-size:12px; margin:0; padding:14px; }
+  h1 { font-size:17px; margin:0 0 6px; letter-spacing:.5px; }
+  .meta { color:#555; font-size:11.5px; line-height:1.8; margin-bottom:10px; }
+  table { width:100%; border-collapse:collapse; }
+  th, td { border:1px solid #b4b4b4; padding:5px 6px; text-align:left; vertical-align:top; }
+  th { background:#efefef; font-weight:600; white-space:nowrap; }
+  .num { text-align:right; white-space:nowrap; font-variant-numeric:tabular-nums; }
+  .nowrap { white-space:nowrap; }
+  .alloc { max-width:360px; word-break:break-all; color:#333; }
+  tfoot td { font-weight:700; background:#f7f7f7; }
+  .foot { margin-top:10px; color:#666; font-size:11px; }
+  .sign { margin-top:26px; color:#444; font-size:11.5px; display:flex; gap:40px; }
+  @media print { thead { display:table-header-group; } tr { page-break-inside:avoid; } }
+</style></head><body>
+<h1>${esc((brand ? brand + ' · ' : '') + '收付款流水')}</h1>
+<div class="meta">${esc(payFilterText())}<br>
+共 ${d.total} 笔${d.items.length < d.total ? `（本页为最近 ${d.items.length} 笔）` : ''}
+｜ 收款合计 ${yuan(d.receive_sum)} ｜ 付款合计 ${yuan(d.pay_sum)} ｜ 净额 ${yuan(d.net)}（其中定金 ${yuan(d.deposit_sum)}）</div>
+<table>
+  <thead><tr><th>时间</th><th>类型</th><th>往来单位</th><th>分摊单据</th><th class="num">金额</th><th>方式</th><th>备注</th><th>操作人</th></tr></thead>
+  <tbody>${body}</tbody>
+  <tfoot><tr><td colspan="4">合计（${d.total} 笔）</td><td class="num">收 ${yuan(d.receive_sum)}<br>付 ${yuan(d.pay_sum)}</td><td colspan="3">净额 ${yuan(d.net)}</td></tr></tfoot>
+</table>
+<div class="sign"><span>制表：____________</span><span>复核：____________</span><span>打印时间：${esc(new Date().toLocaleString('zh-CN', { hour12: false }))}</span></div>
+</body></html>`;
+
+    openPrintWindow(html);
+  }
+
+  async function exportPayFlow(btn) {
+    btn.disabled = true;
+    try {
+      const res = await fetch('/api/finance/payments/export?' + finPayParams().toString(), { credentials: 'same-origin' });
+      if (!res.ok) {
+        let msg = '导出失败';
+        try { const d = await res.json(); msg = d.error || msg; } catch (e) { /* 忽略 */ }
+        throw new Error(msg);
+      }
+      const blob = await res.blob();
+      downloadBlob(blob, `收付款流水_${fileStamp()}.xlsx`);
+      toast('已导出收付款流水');
+    } catch (err) { toast(err.message, true); }
+    btn.disabled = false;
+  }
+
+  // 退单处理：根据单据状态与当前用户角色，分三种情况处理  // - 普通用户：仅能「锁定」申请，等待管理员审批
   // - 管理员：可直接退单；对处于「退单待审」的单据可审批通过或驳回
   async function openReturnModal(type, id) {
     const isPur = type === 'purchase';

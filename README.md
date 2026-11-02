@@ -28,6 +28,7 @@
   收付款金额可调整——管理员直接生效，普通用户需管理员审批；
   采购/销售明细均显示**交易时间**与**交易数量**（单品显示「12 台」，多品显示总件数并标注项数，如「13 · 3项」，悬停可看每个商品的数量），默认按时间倒序（最近交易的排在最前）；
   采购应付 / 销售应收两张明细表都支持**按当前查询结果打印**（A4 横向、跨页自动重复表头、可另存为 PDF）与**导出 Excel**，导出的内容与屏幕上看到的是同一批数据；
+  **收付款流水**同样支持条件查询（**时间段，默认当天** / 类型 / 往来单位 / 支付方式 / 操作人，日期清空即不限），并按当前条件**打印**与**导出 Excel**，标题处实时给出该条件下的收款合计、付款合计与净额；
   「收付流水账」弹窗里的每一笔也支持**导出 Excel**（含分摊到的单据、本笔转预存、支付方式与操作人）
 - 🧾 **退单与审批**：每笔采购/销售可退单，普通用户仅能锁定申请，管理员审批后才回滚库存与资金；采购退单会同时把商品进价还原成「最近一张仍有效的采购单」的价格，并把这次改价从改价报表里撤掉
 - 🗑️ **作废与更正**：管理员可对录错的单据直接**作废**（回滚库存、撤销收付款分摊、删除单据本身，快照留痕在 `doc_voids` 表）；也可**删除整笔收付款记录**、修改单据备注；点单号可查看整单明细
@@ -146,8 +147,10 @@ inventory/
 | POST | `/api/advance/apply` | 把该单位预存余额按单据先后批量冲抵未结清单据（不新增收付款记录） |
 | POST | `/api/purchases/:id/void` `/api/sales/:id/void` | 作废单据（仅管理员：回滚库存、撤销分摊、删除单据，快照写入 `doc_voids`） |
 | PUT | `/api/purchases/:id/note` `/api/sales/:id/note` | 修改单据备注（管理员或该单开单人） |
-| GET | `/api/finance/summary` | 应收应付、定金统计、预付款余额；明细行含交易数量字段 `qty_total`（总件数）、`item_count`（商品项数）、`qty_detail`（各商品数量明细）、`qty_unit`（单品单位） |
+| GET | `/api/finance/summary` | 应收应付、定金统计、预付款余额；明细行含交易数量字段 `qty_total`（总件数）、`item_count`（商品项数）、`qty_detail`（各商品数量明细）、`qty_unit`（单品单位）。收付款流水另接受 `pay_*` 条件（见下两行），并回传 `payments_sum` 小计与 `payments_operators` 操作人候选 |
 | GET | `/api/finance/export` | 按与 `summary` **完全相同**的筛选参数导出 Excel，额外用 `kind=purchase\|sale` 选择应付/应收；内部复用同一份汇总计算，保证「页面看到的」与「导出的」是同一批数据。超 2 万行只截断明细，合计仍按全量算并在表头标注 |
+| GET | `/api/finance/payments` | 收付款流水（打印取数用）：`pay_from` / `pay_to`（留空=不限）/ `pay_direction`（pay\|receive）/ `pay_party`（`supplier:3` 形式）/ `pay_method` / `pay_operator`；返回筛选后的 `total`、收款/付款/定金小计与明细 |
+| GET | `/api/finance/payments/export` | 按同一套 `pay_*` 参数导出收付款流水 Excel（与 `/api/finance/payments`、页面卡片复用同一取数函数） |
 | GET | `/api/partners/:type/:id/transactions` | 往来单位交易清单（type=customer/supplier；product/from/to 筛选） |
 | GET | `/api/partners/:type/:id/transactions/export` | 导出该单位交易清单为 Excel |
 | GET/PUT | `/api/settings` | 系统配置（品牌/动画/权限/销售额/密码策略/侧栏音乐；PUT 仅管理员，支持局部更新） |
