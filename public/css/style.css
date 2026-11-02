@@ -336,6 +336,8 @@ table tfoot td { border-top: 2px solid var(--border); background: var(--bg); pad
 .filter-bar input:focus, .filter-bar select:focus { border-color: var(--primary); }
 .filter-bar .btn-primary, .filter-bar .btn-ghost { padding: 8px 14px; }
 .filter-bar label:last-of-type { margin-right: 0; }
+/* 收付款明细的「打印 / 导出」按钮：推到当前行最右侧，与查询/重置分开，避免误点 */
+.filter-bar .fin-io { display: flex; gap: 8px; margin-left: auto; }
 
 /* 明细表滚动容器（默认约 10 行高度，超出滚动） */
 .table-scroll { max-height: 460px; overflow-y: auto; border-radius: 10px; }

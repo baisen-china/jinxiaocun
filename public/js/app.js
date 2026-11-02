@@ -2878,6 +2878,10 @@
       <label>结束<input type="date" id="f-to-${kind}" value="${f.to}"></label>
       <button class="btn-primary small" data-search="${kind}">查询</button>
       <button class="btn-ghost small" data-reset="${kind}">重置(当月)</button>
+      <span class="fin-io">
+        <button class="btn-ghost small" data-print="${kind}" title="按当前筛选条件打印本表（A4 横向，自动重复表头）">打印</button>
+        <button class="btn-ghost small" data-export="${kind}" title="按当前筛选条件导出 Excel">导出 Excel</button>
+      </span>
     </div>`;
   }
 
@@ -3110,6 +3114,125 @@
       if (kind === 'purchase') finPurFilters = null; else finSalFilters = null;
       renderFinance();
     });
+    // 打印 / 导出：都只作用于「当前已查询出的结果」，不会重新按全量取数
+    $$('#content [data-print]').forEach(btn => btn.onclick = () => printFinance(btn.dataset.print));
+    $$('#content [data-export]').forEach(btn => btn.onclick = () => exportFinance(btn, btn.dataset.export));
+  }
+
+  // 付款构成 → 纯文本状态（页面标签、打印、导出口径必须一致）
+  const FIN_PAY_TEXT = {
+    unpaid: '未付款', adv_settled: '抵扣付完', cash_settled: '现金付完',
+    adv_partial: '抵扣部分+欠款', cash_partial: '现金部分+欠款',
+    mixed_settled: '抵扣+现金付完', mixed_partial: '抵扣+现金+欠款'
+  };
+  const finRowStatus = (r) => (r.docStatus === 'returned' ? '已退单'
+    : r.docStatus === 'pending_return' ? '退单待审'
+      : (FIN_PAY_TEXT[r.pay_kind] || '未付款'));
+
+  // 打印当前筛选结果：新开窗口写一份自包含 HTML。
+  // 不直接 window.print() 主页面，原因有三：
+  //   ① 明细表套在 .table-scroll（max-height:460px）里，直接打印只会得到可见的十来行；
+  //   ② 主页面有侧栏、统计卡、操作按钮列，都得靠 @media print 一个个藏，容易漏；
+  //   ③ 独立窗口能自己定页边距、横向纸张、跨页重复表头，还能让用户另存为 PDF。
+  function printFinance(kind) {
+    const isPur = kind === 'purchase';
+    const list = isPur ? (state.cache.__purList || []) : (state.cache.__salList || []);
+    if (!list.length) { toast('当前筛选条件下没有单据', true); return; }
+    const f = isPur ? finPur() : finSal();
+    const partyArr = isPur ? finSuppliers : finCustomers;
+    const partyText = f.party
+      ? ((partyArr.find(x => String(x.id) === String(f.party)) || {}).name || '全部')
+      : '全部';
+    const who = isPur ? '供应商' : '客户';
+    const colPaid = isPur ? '已付' : '已收';
+    const colDue = isPur ? '未付' : '未收';
+    const brand = (state.branding && state.branding.shopName) || '';
+
+    let cnt = 0, sumTotal = 0, sumPaid = 0, sumOut = 0, retCnt = 0;
+    for (const r of list) {
+      if (r.docStatus === 'returned') { retCnt++; continue; }
+      cnt++; sumTotal += r.total; sumPaid += r.paid; sumOut += r.outstanding;
+    }
+    const body = list.map((r) => {
+      const isRet = r.docStatus === 'returned';
+      return `<tr${isRet ? ' class="ret"' : ''}>
+        <td>${esc(r.bill_no)}</td>
+        <td>${esc((r.created_at || '').slice(0, 16))}</td>
+        <td>${esc(r.partner || (isPur ? '直采' : '散客'))}</td>
+        <td class="prod">${esc(r.qty_detail || r.products || '—')}</td>
+        <td class="num">${intf(r.qty_total)}</td>
+        <td class="num">${yuan(r.total)}</td>
+        <td class="num">${isRet ? '—' : yuan(r.paid)}</td>
+        <td class="num">${isRet ? '—' : yuan(r.outstanding)}</td>
+        <td>${esc(finRowStatus(r))}</td>
+      </tr>`;
+    }).join('');
+
+    const html = `<!doctype html><html lang="zh-CN"><head><meta charset="utf-8">
+<title>${esc((brand ? brand + ' · ' : '') + (isPur ? '采购应付明细' : '销售应收明细'))}</title>
+<style>
+  @page { size: A4 landscape; margin: 10mm; }
+  * { box-sizing: border-box; }
+  body { font-family: "Microsoft YaHei","PingFang SC","Hiragino Sans GB",sans-serif; color:#111; font-size:12px; margin:0; padding:14px; }
+  h1 { font-size:17px; margin:0 0 6px; letter-spacing:.5px; }
+  .meta { color:#555; font-size:11.5px; line-height:1.8; margin-bottom:10px; }
+  table { width:100%; border-collapse:collapse; }
+  th, td { border:1px solid #b4b4b4; padding:5px 6px; text-align:left; vertical-align:top; }
+  th { background:#efefef; font-weight:600; white-space:nowrap; }
+  .num { text-align:right; white-space:nowrap; font-variant-numeric:tabular-nums; }
+  .prod { max-width:300px; word-break:break-all; }
+  tr.ret td { color:#8a8a8a; }
+  tfoot td { font-weight:700; background:#f7f7f7; }
+  .foot { margin-top:10px; color:#666; font-size:11px; }
+  @media print { thead { display:table-header-group; } tr { page-break-inside:avoid; } }
+</style></head><body>
+<h1>${esc((brand ? brand + ' · ' : '') + (isPur ? '采购应付明细' : '销售应收明细'))}</h1>
+<div class="meta">
+  ${who}：${esc(partyText)} ｜ 商品：${esc(f.product || '全部')} ｜ 状态：${esc(({ all: '全部', unpaid: '未付款', partial: '部分付款', settled: '已结清' })[f.status] || '全部')}
+  ｜ 退单：${esc(({ all: '全部', normal: '正常(未退单)', returned: '已退单', pending: '退单待审' })[f.ret] || '全部')}
+  ｜ 日期：${esc(f.from || '不限')} ~ ${esc(f.to || '不限')}<br>
+  共 ${cnt} 笔${retCnt ? `（另有已退单 ${retCnt} 笔，不计入合计）` : ''}
+</div>
+<table>
+  <thead><tr><th>单号</th><th>交易时间</th><th>${who}</th><th>商品明细</th><th class="num">数量</th><th class="num">总金额</th><th class="num">${colPaid}</th><th class="num">${colDue}</th><th>状态</th></tr></thead>
+  <tbody>${body}</tbody>
+  <tfoot><tr><td colspan="5">合计（${cnt} 笔，不含已退单）</td><td class="num">${yuan(sumTotal)}</td><td class="num">${yuan(sumPaid)}</td><td class="num">${yuan(sumOut)}</td><td></td></tr></tfoot>
+</table>
+<div class="foot">打印时间：${esc(new Date().toLocaleString('zh-CN', { hour12: false }))}</div>
+</body></html>`;
+
+    const w = window.open('', '_blank');
+    if (!w) { toast('浏览器拦截了打印窗口，请允许本站弹窗后重试', true); return; }
+    w.document.open();
+    w.document.write(html);
+    w.document.close();
+    // 等一帧再唤起打印，避免部分浏览器在文档尚未就绪时打印出空白页
+    setTimeout(() => { try { w.focus(); w.print(); } catch (e) { /* 用户可能在打印前已关窗 */ } }, 350);
+  }
+
+  // 导出当前筛选结果：参数直接复用 finQuery()，与页面查询用的是同一份 URL 参数
+  async function exportFinance(btn, kind) {
+    const isPur = kind !== 'sale';
+    btn.disabled = true;
+    try {
+      const res = await fetch('/api/finance/export' + finQuery() + '&kind=' + kind, { credentials: 'same-origin' });
+      if (!res.ok) {
+        let msg = '导出失败';
+        try { const d = await res.json(); msg = d.error || msg; } catch (e) { /* 忽略 */ }
+        throw new Error(msg);
+      }
+      const blob = await res.blob();
+      const url = URL.createObjectURL(blob);
+      const a = document.createElement('a');
+      a.href = url;
+      a.download = `${isPur ? '采购应付明细' : '销售应收明细'}_${fileStamp()}.xlsx`;
+      document.body.appendChild(a);
+      a.click();
+      a.remove();
+      setTimeout(() => URL.revokeObjectURL(url), 4000);
+      toast(`已导出${isPur ? '采购应付' : '销售应收'}明细`);
+    } catch (err) { toast(err.message, true); }
+    btn.disabled = false;
   }
 
   // 退单处理：根据单据状态与当前用户角色，分三种情况处理

@@ -2658,9 +2658,12 @@ function inventoryValue() {
   };
 }
 
-app.get('/api/finance/summary', requireAuth, (req, res) => {
+// 财务汇总的计算体：抽成独立函数，供 /api/finance/summary（页面渲染）
+// 与 /api/finance/export（按同一套筛选条件导出 Excel）共用。
+// 为什么不各写一套：筛选条件（p_/s_ 前缀 × 单位/商品/日期/退单/状态）解析起来有十几行，
+// 复制一份日后必然出现「页面显示的」和「导出的」不是同一批数据，而这种差异极难被发现。
+function financeSummaryData(q, req) {
   // 筛选参数（明细列表用；汇总卡片始终按全量统计）
-  const q = req.query || {};
   const now = new Date();
   const y = now.getFullYear(), m = now.getMonth();
   const monthStart = `${y}-${String(m + 1).padStart(2, '0')}-01`;
@@ -2836,7 +2839,7 @@ app.get('/api/finance/summary', requireAuth, (req, res) => {
   const advanceTotal = r2(suppliersAdv.reduce((s, x) => s + x.balance, 0) + customersAdv.reduce((s, x) => s + x.balance, 0));
   const suppliers = db.prepare(`SELECT id, name FROM suppliers ORDER BY name`).all();
   const customers = db.prepare(`SELECT id, name FROM customers ORDER BY name`).all();
-  res.json({
+  return {
     purchase, sale,
     advances: { suppliers: suppliersAdv, customers: customersAdv, total: advanceTotal },
     // 挂在账外、不属于任何单位的钱。有余额时前端会提示去指定归属
@@ -2849,7 +2852,97 @@ app.get('/api/finance/summary', requireAuth, (req, res) => {
     adjustments: adjustments,
     adjustments_pending: adjustments.length,
     suppliers, customers
-  });
+  };
+}
+
+app.get('/api/finance/summary', requireAuth, (req, res) => {
+  res.json(financeSummaryData(req.query || {}, req));
+});
+
+// ---------- 采购应付 / 销售应收明细导出 ----------
+// 关键：与页面共用 financeSummaryData，导出的一定是「当前筛选后正在看的那一批」，
+// 而不是另写一套 SQL 重新查一遍——两套查询迟早会不一致。
+const FIN_EXPORT_MAX_ROWS = 20000;
+app.get('/api/finance/export', requireAuth, (req, res) => {
+  const q = req.query || {};
+  const isPur = q.kind !== 'sale';
+  const d = financeSummaryData(q, req);
+  const bucket = isPur ? d.purchase : d.sale;
+  const list = bucket.list || [];
+  if (!list.length) return res.status(400).json({ error: '当前筛选条件下没有单据，无法导出' });
+
+  // 与交易清单导出同一口径：超限只截断明细，合计仍按全量算，并在表头写明，
+  // 避免几万行的同步 ZIP 把主线程占满数秒，也避免被误当成完整数据。
+  const truncated = list.length > FIN_EXPORT_MAX_ROWS;
+  const outList = truncated ? list.slice(0, FIN_EXPORT_MAX_ROWS) : list;
+
+  const pre = isPur ? 'p_' : 's_';
+  const partyId = parseInt(q[pre + (isPur ? 'supplier' : 'customer')], 10) || 0;
+  const partyList = isPur ? d.suppliers : d.customers;
+  const partyText = partyId ? ((partyList.find((x) => x.id === partyId) || {}).name || ('#' + partyId)) : '全部';
+  const statusText = { all: '全部', unpaid: '未付款', partial: '部分付款', settled: '已结清' };
+  const retText = { all: '全部', normal: '正常(未退单)', returned: '已退单', pending: '退单待审' };
+  // 付款构成 → 状态文案，与前端页面标签口径完全一致
+  const PAY_KIND_TEXT = {
+    unpaid: '未付款', adv_settled: '抵扣付完', cash_settled: '现金付完',
+    adv_partial: '抵扣部分+欠款', cash_partial: '现金部分+欠款',
+    mixed_settled: '抵扣+现金付完', mixed_partial: '抵扣+现金+欠款'
+  };
+  const rowStatus = (r) => (r.docStatus === 'returned' ? '已退单'
+    : r.docStatus === 'pending_return' ? '退单待审'
+      : (PAY_KIND_TEXT[r.pay_kind] || '未付款'));
+
+  const who = isPur ? '供应商' : '客户';
+  const colPaid = isPur ? '已付' : '已收';
+  const colDue = isPur ? '未付' : '未收';
+  const brand = getSettings().branding;
+  const rows = [
+    [`${brand.shopName || ''} · ${isPur ? '采购应付明细' : '销售应收明细'}`],
+    [`筛选：${who} ${partyText} ｜ 商品 ${(q[pre + 'product'] || '').trim() || '全部'} ｜ 状态 ${statusText[q[pre + 'status']] || '全部'}`
+      + ` ｜ 退单 ${retText[q[pre + 'return']] || '全部'}`
+      + ` ｜ 日期 ${(q[pre + 'from'] || '').slice(0, 10) || '不限'} ~ ${(q[pre + 'to'] || '').slice(0, 10) || '不限'}`
+      + ` ｜ 共 ${bucket.listStats.count} 笔`
+      + (truncated ? ` ｜ ⚠ 单次最多导出 ${FIN_EXPORT_MAX_ROWS} 笔，本表仅含最近 ${FIN_EXPORT_MAX_ROWS} 笔；下方合计仍为全量` : '')],
+    [],
+    ['单号', '交易时间', who, '商品明细', '数量', '总金额', '定金(约定)', '定金状态', colPaid, colDue, '状态', '备注']
+  ];
+  for (const r of outList) {
+    const isRet = r.docStatus === 'returned';
+    rows.push([
+      r.bill_no,
+      (r.created_at || '').slice(0, 19),
+      r.partner || (isPur ? '直采' : '散客'),
+      r.qty_detail || r.products || '',
+      r.qty_total || 0,
+      r.total,
+      r.deposit > 0.001 ? r.deposit : '',
+      r.deposit > 0.001 ? (r.deposit_status || '') : '',
+      isRet ? '' : r.paid,          // 已退单行与页面一致：金额留空，不计入合计
+      isRet ? '' : r.outstanding,
+      rowStatus(r),
+      isRet ? ('退单原因：' + (r.return_reason || '—')) : ''
+    ]);
+  }
+  // 合计按「筛选后的全量」算（不是截断后的明细），与页面表尾口径一致
+  let cnt = 0, sumTotal = 0, sumPaid = 0, sumOut = 0, retCnt = 0;
+  for (const r of list) {
+    if (r.docStatus === 'returned') { retCnt++; continue; }
+    cnt++; sumTotal += r.total; sumPaid += r.paid; sumOut += r.outstanding;
+  }
+  rows.push([]);
+  rows.push([`合计（${cnt} 笔，不含已退单）`, '', '', '', '', r2(sumTotal), '', '', r2(sumPaid), r2(sumOut), '', '']);
+  if (retCnt) rows.push([`另有已退单 ${retCnt} 笔，不计入合计`, '', '', '', '', '', '', '', '', '', '', '']);
+
+  let buf;
+  try { buf = buildWorkbook([{ name: isPur ? '采购应付' : '销售应收', rows }]); }
+  catch (e) { return res.status(500).json({ error: '生成 Excel 失败：' + e.message }); }
+
+  const stamp = db.prepare("SELECT strftime('%Y%m%d','now','localtime') AS d").get().d;
+  const fname = `${isPur ? '采购应付明细' : '销售应收明细'}_${stamp}.xlsx`;
+  res.setHeader('Content-Type', 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet');
+  res.setHeader('Content-Disposition', `attachment; filename="finance_${isPur ? 'payable' : 'receivable'}_${stamp}.xlsx"; filename*=UTF-8''${encodeURIComponent(fname)}`);
+  res.setHeader('Content-Length', buf.length);
+  res.end(buf);
 });
 
 // ---------- 报表 ----------
