@@ -1,0 +1,12 @@
+# Windows 批处理必须保持 CRLF。
+# cmd.exe 对 LF-only 的 .bat 会按字节错位解析，表现为中文乱码、行被吞掉、
+# 甚至报「'tokens' 不是内部或外部命令」。这里钉死行尾，避免不同机器/编辑器
+# 的 core.autocrlf 设置把它改掉。
+*.bat text eol=crlf
+
+# 其余文本按仓库默认（LF）
+*.js text
+*.json text
+*.md text
+*.css text
+*.html text

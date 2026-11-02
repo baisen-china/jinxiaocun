@@ -1,0 +1,21 @@
+{
+  "name": "inventory-local",
+  "version": "1.0.0",
+  "description": "天下第一家专用进销存系统（采购/销售/库存），支持手机访问与外网穿透",
+  "type": "commonjs",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js",
+    "dev": "node server.js",
+    "test": "node --test \"test/**/*.test.js\""
+  },
+  "engines": {
+    "node": ">=22"
+  },
+  "dependencies": {
+    "bcryptjs": "^2.4.3",
+    "better-sqlite3": "^13.0.3",
+    "express": "^4.19.2",
+    "express-session": "^1.18.0"
+  }
+}
