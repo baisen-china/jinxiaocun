@@ -677,6 +677,63 @@ app.get('/api/products/categories', requireAuth, (req, res) => {
   res.json(rows.map(r => r.category));
 });
 
+// 商品清单导出：跟随页面搜索 / 仅看预警。
+// 前 6 列表头与导入模板同名，方便肉眼对照；但「当前库存」故意不叫「初始库存」——
+// 若同名，用户导出后再导入到另一个库时会把库存当成「初始库存」再叠加一次，直接翻倍。
+// 导入只认自己那份模板的表头，多出来的列会被忽略，所以这里可以放心加列。
+app.get('/api/products/export', requireAuth, (req, res) => {
+  const search = String(req.query.search || '').trim();
+  const low = req.query.low === '1' || req.query.low === 'true';
+  let sql = 'SELECT * FROM products WHERE 1=1';
+  const params = [];
+  if (search) {
+    sql += ' AND (name LIKE ? OR sku LIKE ? OR category LIKE ?)';
+    const s = `%${search}%`;
+    params.push(s, s, s);
+  }
+  if (low) sql += ' AND stock <= min_stock';
+  sql += ' ORDER BY category, sku, id';
+  const rows = db.prepare(sql).all(...params);
+  if (!rows.length) return res.status(400).json({ error: '当前筛选条件下没有商品，无法导出' });
+
+  const head = ['商品编码', '商品名称', '分类', '单位', '进货价', '销售价', '当前库存', '库存预警值', '备注', '状态', '库存成本金额'];
+  const body = rows.map(p => {
+    const stock = Number(p.stock) || 0;
+    const cost = Number(p.purchase_price) || 0;
+    return [
+      p.sku || '', p.name || '', p.category || '', p.unit || '',
+      r2(cost), r2(p.sale_price), stock, Number(p.min_stock) || 0,
+      p.note || '',
+      stock <= (Number(p.min_stock) || 0) ? '预警' : '正常',
+      r2(stock * cost)
+    ];
+  });
+  const sumCost = rows.reduce((s, p) => s + (Number(p.stock) || 0) * (Number(p.purchase_price) || 0), 0);
+
+  const sheets = [{
+    name: '商品清单',
+    rows: [
+      ['商品清单'],
+      [`导出时间：${nowLocal()}　｜　共 ${rows.length} 种商品　｜　库存成本合计 ${r2(sumCost)}${search ? `　｜　搜索：${search}` : ''}${low ? '　｜　仅库存预警' : ''}`],
+      [],
+      head,
+      ...body,
+      [],
+      ['合计', `${rows.length} 种商品`, '', '', '', '', rows.reduce((s, p) => s + (Number(p.stock) || 0), 0), '', '', '', r2(sumCost)]
+    ]
+  }];
+
+  let buf;
+  try { buf = buildWorkbook(sheets); }
+  catch (e) { return res.status(500).json({ error: '生成 Excel 失败：' + e.message }); }
+  const stamp = db.prepare("SELECT strftime('%Y%m%d','now','localtime') AS d").get().d;
+  const fname = `商品清单${low ? '_预警' : ''}_${stamp}.xlsx`;
+  res.setHeader('Content-Type', 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet');
+  res.setHeader('Content-Disposition', `attachment; filename="products_${stamp}.xlsx"; filename*=UTF-8''${encodeURIComponent(fname)}`);
+  res.setHeader('Content-Length', buf.length);
+  res.end(buf);
+});
+
 // 商品库模板导出：数据表只有表头（避免示例行被误导入），说明表写规则与示例。
 // 列顺序即导入解析的表头，请勿改动列名。
 const PRODUCT_TEMPLATE_HEADERS = ['商品编码', '商品名称', '分类', '单位', '进货价', '销售价', '初始库存', '库存预警值', '备注'];
@@ -1324,7 +1381,10 @@ app.post('/api/purchases', requireAuth, (req, res) => {
   try {
     const r = doPurchase(req.body || {}, req.session.username);
     const doc = db.prepare('SELECT * FROM purchases WHERE id = ?').get(r.purchaseId);
-    res.json({ ...doc, advance_applied: r.advApplied });
+    // 补上未付金额：原来只有销售侧返回 outstanding，采购提交后前端提示不出「还欠多少」，
+    // 而采购恰恰是最常见挂账的场景
+    const paid = r2(db.prepare("SELECT COALESCE(SUM(amount),0) AS s FROM payment_allocations WHERE doc_type='purchase' AND doc_id=?").get(doc.id).s);
+    res.json({ ...doc, advance_applied: r.advApplied, paid_now: 0, paid, outstanding: r2((Number(doc.total_amount) || 0) - paid) });
   } catch (e) {
     res.status(400).json({ error: e.message });
   }
@@ -1344,7 +1404,9 @@ app.get('/api/purchases/:id', requireAuth, (req, res) => {
   const head = db.prepare(`SELECT p.*, s.name AS supplier_name FROM purchases p LEFT JOIN suppliers s ON p.supplier_id = s.id WHERE p.id = ?`).get(req.params.id);
   if (!head) return res.status(404).json({ error: '采购单不存在' });
   const items = db.prepare(`SELECT pi.*, pr.name AS product_name, pr.sku, pr.unit FROM purchase_items pi LEFT JOIN products pr ON pi.product_id = pr.id WHERE pi.purchase_id = ?`).all(req.params.id);
-  res.json({ ...head, items });
+  // 已付/未付：打印单据时要直接印在纸上，不能让前端再猜一遍
+  const paid = r2(db.prepare("SELECT COALESCE(SUM(amount),0) AS s FROM payment_allocations WHERE doc_type='purchase' AND doc_id=?").get(head.id).s);
+  res.json({ ...head, items, paid, outstanding: r2((Number(head.total_amount) || 0) - paid) });
 });
 
 // ---------- 销售出库 ----------
@@ -1491,7 +1553,8 @@ app.get('/api/sales/:id', requireAuth, (req, res) => {
   const head = db.prepare(`SELECT s.*, c.name AS customer_name FROM sales s LEFT JOIN customers c ON s.customer_id = c.id WHERE s.id = ?`).get(req.params.id);
   if (!head) return res.status(404).json({ error: '销售单不存在' });
   const items = db.prepare(`SELECT si.*, pr.name AS product_name, pr.sku, pr.unit FROM sale_items si LEFT JOIN products pr ON si.product_id = pr.id WHERE si.sale_id = ?`).all(req.params.id);
-  res.json({ ...head, items });
+  const paid = r2(db.prepare("SELECT COALESCE(SUM(amount),0) AS s FROM payment_allocations WHERE doc_type='sale' AND doc_id=?").get(head.id).s);
+  res.json({ ...head, items, paid, outstanding: r2((Number(head.total_amount) || 0) - paid) });
 });
 
 // ---------- 单据备注修改 / 作废 ----------
@@ -1727,6 +1790,67 @@ app.get('/api/inventory', requireAuth, (req, res) => {
 app.get('/api/inventory/alerts', requireAuth, (req, res) => {
   const rows = db.prepare('SELECT * FROM products WHERE stock <= min_stock ORDER BY stock ASC').all();
   res.json(rows);
+});
+
+// 库存导出：mode=stock 是「盘点表」（刻意不含价格，可以放心发给仓库手填）；
+// mode=full 是完整库存清单（含成本金额，给老板/会计看）。两者与页面共用 low 筛选。
+app.get('/api/inventory/export', requireAuth, (req, res) => {
+  const low = req.query.low === '1' || req.query.low === 'true';
+  const mode = String(req.query.mode || 'full').toLowerCase() === 'stock' ? 'stock' : 'full';
+  const rows = low
+    ? db.prepare('SELECT * FROM products WHERE stock <= min_stock ORDER BY stock ASC, id DESC').all()
+    : db.prepare('SELECT * FROM products ORDER BY stock <= min_stock, stock ASC, id DESC').all();
+  if (!rows.length) return res.status(400).json({ error: low ? '当前没有库存预警商品' : '还没有商品数据，无法导出' });
+
+  const isStock = mode === 'stock';
+  const head = isStock
+    ? ['SKU', '商品名称', '分类', '单位', '账面库存', '实盘数量', '差异', '备注']
+    : ['SKU', '商品名称', '分类', '单位', '库存', '下限', '进货价', '销售价', '库存成本金额', '库存售价金额', '状态', '备注'];
+  const body = rows.map((p) => {
+    const stock = Number(p.stock) || 0;
+    const cost = Number(p.purchase_price) || 0;
+    if (isStock) {
+      // 后三列留空，打印出来手写；不要预填 0，否则会被当成「已盘且无差异」
+      return [p.sku || '', p.name || '', p.category || '', p.unit || '', stock, '', '', ''];
+    }
+    return [
+      p.sku || '', p.name || '', p.category || '', p.unit || '',
+      stock, Number(p.min_stock) || 0,
+      r2(cost), r2(p.sale_price), r2(stock * cost), r2(stock * (Number(p.sale_price) || 0)),
+      stock <= (Number(p.min_stock) || 0) ? '预警' : '正常',
+      p.note || ''
+    ];
+  });
+
+  const sumQty = rows.reduce((s, p) => s + (Number(p.stock) || 0), 0);
+  const sumCost = rows.reduce((s, p) => s + (Number(p.stock) || 0) * (Number(p.purchase_price) || 0), 0);
+  const tail = isStock
+    ? [['合计', `${rows.length} 种商品`, '', '', sumQty, '', '', '']]
+    : [['合计', `${rows.length} 种商品`, '', '', sumQty, '', '', '', r2(sumCost), r2(rows.reduce((s, p) => s + (Number(p.stock) || 0) * (Number(p.sale_price) || 0), 0)), '', '']];
+
+  const title = isStock ? '库存盘点表' : '库存清单';
+  const sheets = [{
+    name: title,
+    rows: [
+      [`${title}${low ? '（仅库存预警）' : ''}`],
+      [`导出时间：${nowLocal()}　｜　共 ${rows.length} 种商品${isStock ? '　｜　请按实际盘点数填写「实盘数量」，差异 = 实盘 − 账面' : `　｜　成本金额合计 ${r2(sumCost)}`}`],
+      [],
+      head,
+      ...body,
+      [],
+      ...tail
+    ]
+  }];
+
+  let buf;
+  try { buf = buildWorkbook(sheets); }
+  catch (e) { return res.status(500).json({ error: '生成 Excel 失败：' + e.message }); }
+  const stamp = db.prepare("SELECT strftime('%Y%m%d','now','localtime') AS d").get().d;
+  const fname = `${title}${low ? '_预警' : ''}_${stamp}.xlsx`;
+  res.setHeader('Content-Type', 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet');
+  res.setHeader('Content-Disposition', `attachment; filename="inventory_${mode}_${stamp}.xlsx"; filename*=UTF-8''${encodeURIComponent(fname)}`);
+  res.setHeader('Content-Length', buf.length);
+  res.end(buf);
 });
 
 // 待办汇总：退单待审 + 金额调整待审 + 库存告警，供仪表盘顶部提醒
@@ -2475,11 +2599,11 @@ app.get('/api/advance-balance', requireAuth, (req, res) => {
 });
 
 // 某往来单位的收付流水账（收付款明细 + 预付款/预收款余额 + 当前应付/应收）
-app.get('/api/party-ledger', requireAuth, (req, res) => {
-  const { party_type, party_id } = req.query;
+// 收付款流水账（单个往来单位）。页面与导出共用，避免两套口径。
+function partyLedgerPayData(party_type, party_id) {
   const pid = parseInt(party_id);
   const pt = party_type === 'supplier' ? 'supplier' : 'customer';
-  if (!pid) return res.status(400).json({ error: '缺少往来单位' });
+  if (!pid) return { err: 400, msg: '缺少往来单位' };
   const wantDir = pt === 'supplier' ? 'pay' : 'receive';
   const tbl = pt === 'supplier' ? 'purchases' : 'sales';
   const partyCol = pt === 'supplier' ? 'supplier_id' : 'customer_id';
@@ -2520,14 +2644,75 @@ app.get('/api/party-ledger', requireAuth, (req, res) => {
     if (rest > 0.001) toAdvance = r2(toAdvance + rest);
   }
 
-  res.json({
+  return {
     party: { id: pid, name: partyName(pt, pid), type: pt },
     payable: r2(payable),
     advance_balance: r2(advance),
     direction: wantDir,
     summary: { total_in: totalIn, total_out: totalOut, allocated, to_advance: toAdvance },
     transactions
+  };
+}
+
+app.get('/api/party-ledger', requireAuth, (req, res) => {
+  const { party_type, party_id } = req.query;
+  const d = partyLedgerPayData(party_type, party_id);
+  if (d.err) return res.status(d.err).json({ error: d.msg });
+  res.json(d);
+});
+
+// 收付流水账导出：每笔钱冲了哪张单、还剩多少转预存，一次说清，便于对账
+app.get('/api/party-ledger/export', requireAuth, (req, res) => {
+  const { party_type, party_id } = req.query;
+  const d = partyLedgerPayData(party_type, party_id);
+  if (d.err) return res.status(d.err).json({ error: d.msg });
+  if (!d.transactions.length) return res.status(400).json({ error: '该单位还没有收付款记录，无法导出' });
+
+  const isSup = d.party.type === 'supplier';
+  const METHODS = { cash: '现金', bank: '银行转账', alipay: '支付宝', wechat: '微信', other: '其他' };
+  const body = d.transactions.map((t) => {
+    const alloc = (t.allocations || []).length
+      ? t.allocations.map(a => `${a.doc_no || (a.doc_type + a.doc_id)} ${r2(a.amount)}`).join('、')
+      : '预付款/预收款（未分摊）';
+    const rest = r2(t.amount - t.alloc_total);
+    return [
+      t.created_at || '',
+      t.is_deposit ? '定金' : (t.direction === 'pay' ? '付款' : '收款'),
+      r2(t.amount),
+      alloc,
+      rest > 0.001 ? r2(rest) : 0,
+      METHODS[t.method] || t.method || '',
+      t.note || '',
+      t.operator || ''
+    ];
   });
+
+  const sum = d.direction === 'pay'
+    ? [['合计', '', r2(d.summary.total_out), `已分摊 ${d.summary.allocated}`, r2(d.summary.to_advance), '', `当前应付未结清 ${d.payable}；预存余额 ${d.advance_balance}`, '']]
+    : [['合计', '', r2(d.summary.total_in), `已分摊 ${d.summary.allocated}`, r2(d.summary.to_advance), '', `当前应收未收 ${d.payable}；预存余额 ${d.advance_balance}`, '']];
+
+  const sheets = [{
+    name: '收付流水账',
+    rows: [
+      [`${d.party.name} · ${isSup ? '采购付款' : '销售收款'}流水账`],
+      [`共 ${d.transactions.length} 笔　｜　${isSup ? '累计付款' : '累计收款'} ${d.direction === 'pay' ? d.summary.total_out : d.summary.total_in}　｜　导出时间：${nowLocal()}`],
+      [],
+      ['时间', '类型', '金额', '分摊单据', '本笔转预存', '方式', '备注', '操作人'],
+      ...body,
+      [],
+      ...sum
+    ]
+  }];
+
+  let buf;
+  try { buf = buildWorkbook(sheets); }
+  catch (e) { return res.status(500).json({ error: '生成 Excel 失败：' + e.message }); }
+  const stamp = db.prepare("SELECT strftime('%Y%m%d','now','localtime') AS d").get().d;
+  const fname = `${d.party.name}_收付流水账_${stamp}.xlsx`;
+  res.setHeader('Content-Type', 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet');
+  res.setHeader('Content-Disposition', `attachment; filename="pay_ledger_${stamp}.xlsx"; filename*=UTF-8''${encodeURIComponent(fname)}`);
+  res.setHeader('Content-Length', buf.length);
+  res.end(buf);
 });
 
 app.get('/api/payments', requireAuth, (req, res) => {
@@ -3090,32 +3275,52 @@ app.get('/api/reports/customer/:id/sales', requireAuth, (req, res) => {
 
 // 往来单位流水账：单据（采购/销售）与收付款按时间合并，倒序返回
 // type: supplier | customer
-app.get('/api/reports/party/:type/:id/ledger', requireAuth, (req, res) => {
-  const type = req.params.type === 'customer' ? 'customer' : 'supplier';
-  const id = parseInt(req.params.id);
+// 往来单位流水账（单家）。JSON 接口与导出共用这一份计算，避免「看到的」和「导出的」不一致。
+//
+// 关于日期段：from/to 只过滤**明细条目**，余额类字段（未结清 / 预存）始终按全量口径算。
+// 这不是偷懒——「单据合计 − 已付 = 未结清」这个等式只在全量时成立；若把三者都按区间裁开，
+// 表尾就会出现「7 月单据 1 万、已付 3 千、未结清 0」这种自相矛盾的组合（因为 7 月之前的欠款没算进去）。
+function partyLedgerData(typeParam, idParam, q = {}) {
+  const type = typeParam === 'customer' ? 'customer' : 'supplier';
+  const id = parseInt(idParam);
   const isSup = type === 'supplier';
   const isUnlinked = id === 0;   // id=0 表示「未指定供应商/客户」的汇总（直采 / 散客）
+
+  let from = String(q.from || '').trim().slice(0, 10);
+  let to = String(q.to || '').trim().slice(0, 10);
+  if (from && to && from > to) { const t = from; from = to; to = t; }   // 起止颠倒自动交换
+  const filtered = !!(from || to);
+  const inRange = (at) => {
+    const d = String(at || '').slice(0, 10);
+    if (from && d < from) return false;
+    if (to && d > to) return false;
+    return true;
+  };
+
   let party;
   if (isUnlinked) {
     party = { id: 0, name: isSup ? '直采（未指定供应商）' : '散客（未指定客户）' };
   } else {
     party = db.prepare(`SELECT id, name FROM ${isSup ? 'suppliers' : 'customers'} WHERE id=?`).get(id);
-    if (!party) return res.status(404).json({ error: isSup ? '供应商不存在' : '客户不存在' });
+    if (!party) return { err: 404, msg: isSup ? '供应商不存在' : '客户不存在' };
   }
 
   // 单据流水：正数（增加应付/应收）。已退单的不计入（其资金已释放为预存，余额已归零）
   // id=0 时按「供应商/客户为空」筛选直采/散客单据
-  const docs = isSup
+  const docsAll = isSup
     ? db.prepare(`SELECT id, bill_no AS no, total_amount AS amount, deposit, created_at AS at, note
         FROM purchases WHERE ${isUnlinked ? 'supplier_id IS NULL' : 'supplier_id=?'} AND (status IS NULL OR status != 'returned')`).all(...(isUnlinked ? [] : [id]))
     : db.prepare(`SELECT id, bill_no AS no, total_amount AS amount, total_profit AS profit, deposit, created_at AS at, note
         FROM sales WHERE ${isUnlinked ? 'customer_id IS NULL' : 'customer_id=?'} AND (status IS NULL OR status != 'returned')`).all(...(isUnlinked ? [] : [id]));
+  const docs = filtered ? docsAll.filter(d => inRange(d.at)) : docsAll;
 
   // 收付款流水：负数（冲减应付/应收）
   // 优先按往来单位取；未指定单位的（party_id 为空）用其分摊到的单据反推归属，
   // 否则这些付款会因为没选单位而在流水账里彻底消失。
   const docType = isSup ? 'purchase' : 'sale';
-  const docMap = new Map(docs.map(d => [d.id, d.no]));
+  // 归属映射必须用「全量单据」建：若只用区间内的单据，那么一笔 6 月付款冲 5 月单据时，
+  // 5 月单据不在区间里，这笔付款就会被判成「跨单位」而整笔消失。
+  const docMap = new Map(docsAll.map(d => [d.id, d.no]));
   const payRows = db.prepare(`SELECT id, amount, method, note, is_deposit, created_at AS at, party_type, party_id
     FROM payments
     WHERE direction=? AND ((party_type=? AND party_id=?) OR party_id IS NULL)
@@ -3123,19 +3328,20 @@ app.get('/api/reports/party/:type/:id/ledger', requireAuth, (req, res) => {
     .all(isSup ? 'pay' : 'receive', type, id);
   const allocStmt = db.prepare('SELECT doc_type, doc_id, amount FROM payment_allocations WHERE payment_id=?');
 
-  const pays = [];
+  const paysAll = [];
   for (const p of payRows) {
     const all = allocStmt.all(p.id);
     const mine = all.filter(a => a.doc_type === docType && docMap.has(a.doc_id))
       .map(a => ({ bill_no: docMap.get(a.doc_id), doc_id: a.doc_id, amount: r2(a.amount) }));
     if (p.party_id != null) {
-      pays.push({ ...p, allocs: mine });
+      paysAll.push({ ...p, allocs: mine });
     } else if (all.length > 0 && mine.length === all.length) {
       // 该笔收付款全部分摊在本单位的单据上，可确认属于本单位
-      pays.push({ ...p, allocs: mine, inferred: true });
+      paysAll.push({ ...p, allocs: mine, inferred: true });
     }
     // 跨单位分摊的（无法确定归属）不计入任何一方，避免重复统计
   }
+  const pays = filtered ? paysAll.filter(p => inRange(p.at)) : paysAll;
 
   const entries = [];
   for (const d of docs) {
@@ -3173,6 +3379,8 @@ app.get('/api/reports/party/:type/:id/ledger', requireAuth, (req, res) => {
   const docTotal = r2(docs.reduce((s, d) => s + d.amount, 0));
   const paidTotal = r2(pays.reduce((s, p) => s + p.amount, 0));
   const depositTotal = r2(docs.reduce((s, d) => s + (d.deposit || 0), 0));
+  const allDocTotal = r2(docsAll.reduce((s, d) => s + d.amount, 0));
+  const allPaidTotal = r2(paysAll.reduce((s, p) => s + p.amount, 0));
   // 已分摊到本单位单据上的金额（与 ar-ap 的"已付/已收"同一口径）
   const allocatedTotal = isSup
     ? r2(db.prepare(`SELECT COALESCE(SUM(a.amount),0) AS s FROM payment_allocations a
@@ -3181,20 +3389,94 @@ app.get('/api/reports/party/:type/:id/ledger', requireAuth, (req, res) => {
     : r2(db.prepare(`SELECT COALESCE(SUM(a.amount),0) AS s FROM payment_allocations a
         JOIN sales s2 ON a.doc_type='sale' AND a.doc_id=s2.id WHERE ${isUnlinked ? 's2.customer_id IS NULL' : 's2.customer_id=?'}`)
         .get(...(isUnlinked ? [] : [id])).s);
-  res.json({
+  return {
     type,
     party,
+    range: { from, to, filtered },
     totals: {
-      docTotal,                                   // 累计采购/销售金额
-      paidTotal,                                  // 累计已付/已收（含预存）
-      allocatedTotal,                             // 已分摊到单据的金额
-      outstanding: r2(docTotal - allocatedTotal), // 未结清（与总应收/总应付一致）
-      advance: r2(paidTotal - allocatedTotal),    // 预付款/预收款余额（已付但未分摊）
-      balance: r2(docTotal - paidTotal),
+      docTotal,                                   // 期间内采购/销售金额（未筛选=累计）
+      paidTotal,                                  // 期间内已付/已收（含预存）
+      allocatedTotal,                             // 已分摊到单据的金额（全量）
+      // 余额口径固定用全量，避免筛选后表尾出现自相矛盾的等式
+      outstanding: r2(allDocTotal - allocatedTotal), // 未结清（与总应收/总应付一致）
+      advance: r2(allPaidTotal - allocatedTotal),    // 预付款/预收款余额（已付但未分摊）
+      balance: r2(docTotal - paidTotal),             // 期间净发生额（未筛选=历史净额）
+      allDocTotal,
+      allPaidTotal,
       depositTotal
     },
     entries
-  });
+  };
+}
+
+app.get('/api/reports/party/:type/:id/ledger', requireAuth, (req, res) => {
+  const d = partyLedgerData(req.params.type, req.params.id, req.query || {});
+  if (d.err) return res.status(d.err).json({ error: d.msg });
+  res.json(d);
+});
+
+// 单家往来流水账导出：与页面同一个日期段、同一份计算
+app.get('/api/reports/party/:type/:id/ledger/export', requireAuth, (req, res) => {
+  const d = partyLedgerData(req.params.type, req.params.id, req.query || {});
+  if (d.err) return res.status(d.err).json({ error: d.msg });
+  if (!d.entries.length) return res.status(400).json({ error: '该期间没有往来记录，无法导出' });
+
+  const isSup = d.type === 'supplier';
+  const t = d.totals;
+  const METHODS = { cash: '现金', bank: '银行转账', alipay: '支付宝', wechat: '微信', other: '其他' };
+  const rows = [[
+    '时间', '类型', '单号 / 事项', isSup ? '应付增加' : '应收增加',
+    isSup ? '已付' : '已收', '说明', '操作人'
+  ]];
+  for (const e of d.entries) {
+    if (e.kind === 'doc') {
+      const bits = [];
+      if (e.deposit > 0.001) bits.push(`约定定金 ${e.deposit}`);
+      if (!isSup && e.profit != null) bits.push(`利润 ${e.profit}`);
+      if (e.note) bits.push(e.note);
+      rows.push([e.at, isSup ? '采购入库' : '销售出库', e.no, r2(e.amount), '', bits.join(' · '), '']);
+    } else {
+      const bits = [];
+      bits.push(METHODS[e.method] || e.method || '现金');
+      if (e.is_deposit) bits.unshift('定金');
+      if ((e.allocs || []).length) bits.push('冲抵 ' + e.allocs.map(a => `${a.bill_no || ''} ${r2(a.amount)}`).join('、'));
+      if (e.to_advance > 0.001) bits.push(`转预存 ${r2(e.to_advance)}`);
+      if (e.note) bits.push(e.note);
+      const label = e.is_deposit ? (isSup ? '付定金' : '收定金') : (isSup ? '付款' : '收款');
+      rows.push([e.at, label, '', '', r2(e.amount), bits.join(' · '), '']);
+    }
+  }
+  rows.push([]);
+  if (d.range.filtered) {
+    rows.push(['本期间合计', '', `单据 ${t.docTotal}`, t.docTotal, t.paidTotal,
+      `未结清余额 ${t.outstanding}（全量口径，含本期间之外的往来）`, '']);
+  } else {
+    rows.push(['合计', '', `单据 ${t.docTotal}`, t.docTotal, t.paidTotal,
+      `单据合计 − 已付 = 未结清 ${t.outstanding}${t.advance > 0.001 ? `；另有预存 ${t.advance}` : ''}`, '']);
+  }
+
+  const period = d.range.filtered
+    ? `${d.range.from || '不限'} ~ ${d.range.to || '不限'}`
+    : '全部';
+  const sheets = [{
+    name: '往来流水账',
+    rows: [
+      [`${d.party.name} · ${isSup ? '采购应付' : '销售应收'}往来流水账`],
+      [`期间：${period}　｜　共 ${d.entries.length} 笔　｜　导出时间：${nowLocal()}`],
+      [],
+      ...rows
+    ]
+  }];
+
+  let buf;
+  try { buf = buildWorkbook(sheets); }
+  catch (e) { return res.status(500).json({ error: '生成 Excel 失败：' + e.message }); }
+  const stamp = db.prepare("SELECT strftime('%Y%m%d','now','localtime') AS d").get().d;
+  const fname = `${d.party.name}_往来流水账_${stamp}.xlsx`;
+  res.setHeader('Content-Type', 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet');
+  res.setHeader('Content-Disposition', `attachment; filename="ledger_${stamp}.xlsx"; filename*=UTF-8''${encodeURIComponent(fname)}`);
+  res.setHeader('Content-Length', buf.length);
+  res.end(buf);
 });
 
 // 本期经营数据（默认当月；支持 from/to=YYYY-MM-DD 日期段，或旧参数 period=YYYY-MM 整月）

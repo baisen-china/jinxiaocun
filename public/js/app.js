@@ -1325,7 +1325,8 @@
     const act = $('#topbar-actions');
     act.innerHTML = `<button class="btn-primary" id="add-product">+ 新增商品</button>
       <button class="btn-ghost" id="dl-template">⬇️ 下载模板</button>
-      <button class="btn-ghost" id="import-products">⬆️ 导入商品</button>`;
+      <button class="btn-ghost" id="import-products">⬆️ 导入商品</button>
+      <button class="btn-ghost" id="export-products" title="按当前搜索 / 仅看预警导出商品清单">⬇️ 导出清单</button>`;
     $('#content').innerHTML = `<div class="card"><div class="toolbar">
       <input id="prod-search" placeholder="搜索名称 / SKU / 分类">
       <label style="display:flex;align-items:center;gap:6px;font-size:13px;color:var(--text-soft)"><input type="checkbox" id="prod-low"> 仅看预警</label>
@@ -1333,6 +1334,7 @@
     $('#add-product').onclick = () => openProductModal();
     $('#dl-template').onclick = () => downloadTemplate();
     $('#import-products').onclick = () => openImportModal();
+    $('#export-products').onclick = (e) => exportProducts(e.currentTarget);
     const load = debounce(async () => {
       const s = $('#prod-search').value.trim();
       const low = $('#prod-low').checked ? '1' : '';
@@ -1373,6 +1375,29 @@
   }
 
   // ---------- 商品导入 / 模板 ----------
+  // 商品清单导出：参数直接读页面输入框，与列表用的是同一套筛选
+  async function exportProducts(btn) {
+    const s = ($('#prod-search') && $('#prod-search').value.trim()) || '';
+    const low = !!($('#prod-low') && $('#prod-low').checked);
+    if (btn) btn.disabled = true;
+    try {
+      const qs = `?search=${encodeURIComponent(s)}${low ? '&low=1' : ''}`;
+      const res = await fetch('/api/products/export' + qs, { credentials: 'same-origin' });
+      if (!res.ok) {
+        let msg = '导出失败';
+        try { const d = await res.json(); msg = d.error || msg; } catch (e) { /* 忽略 */ }
+        throw new Error(msg);
+      }
+      const blob = await res.blob();
+      downloadBlob(blob, `商品清单${low ? '_预警' : ''}_${fileStamp()}.xlsx`);
+      toast('已导出商品清单');
+    } catch (e) {
+      toast(e.message, true);
+    } finally {
+      if (btn) btn.disabled = false;
+    }
+  }
+
   function downloadBlob(blob, filename) {
     const url = URL.createObjectURL(blob);
     const a = document.createElement('a');
@@ -1692,7 +1717,7 @@
         </div>
         <div class="table-scroll">
           <div class="table-wrap"><table class="tx-table">
-            <thead><tr><th>交易时间</th><th>单号</th><th>商品明细</th><th class="num">件数</th><th class="num">金额</th><th class="num">已${isSup ? '付' : '收'}</th><th class="num">未${isSup ? '付' : '收'}</th><th>状态</th></tr></thead>
+            <thead><tr><th>交易时间</th><th>单号</th><th>商品明细</th><th class="num">件数</th><th class="num">金额</th><th class="num">已${isSup ? '付' : '收'}</th><th class="num">未${isSup ? '付' : '收'}</th><th>状态</th><th>操作</th></tr></thead>
             <tbody>
               ${d.list.map(r => {
                 const tag = r.status === 'returned'
@@ -1710,6 +1735,7 @@
                   <td class="num">${yuan(r.paid)}</td>
                   <td class="num ${r.outstanding > 0.001 && r.status !== 'returned' ? 'danger' : ''}">${yuan(r.outstanding)}</td>
                   <td>${tag}</td>
+                  <td class="nowrap"><button class="btn-ghost small" data-print="${r.id}">打印</button></td>
                 </tr>`;
               }).join('')}
             </tbody>
@@ -1747,6 +1773,10 @@
       try {
         const d = await api('GET', `/api/partners/${type}/${id}/transactions?${qs()}`);
         body.innerHTML = tableHtml(d);
+        // 补打历史单据：交易清单是唯一能翻到旧单的地方，打印入口就挂在这里
+        body.querySelectorAll('[data-print]').forEach((b) => {
+          b.onclick = () => printDoc(isSup ? 'purchase' : 'sale', parseInt(b.dataset.print));
+        });
       } catch (err) {
         body.innerHTML = `<p class="empty">${esc(err.message)}</p>`;
       }
@@ -2160,10 +2190,10 @@
         if (res.paid_now > 0.001) bits.push(`本次收款 ${yuan(res.paid_now)}`);
         if (res.outstanding > 0.001) bits.push(`${isPur ? '未付' : '未收'} ${yuan(res.outstanding)} ${isPur ? '已挂应付' : '已挂应收'}`);
         else if (!isPur) bits.push('本单已结清');
-        toast(`单据已提交：${res.bill_no}；${bits.join('，')}`);
         await refreshCache();
         kind === 'purchase' ? renderPurchase() : renderSale();
         loadSidebarStats();   // 立刻刷新侧栏销售额
+        showDocDone(kind, res, bits);   // 开完单是最需要出纸的时刻，这里直接给打印入口
       } catch (e) { msg.className = 'bill-msg'; msg.textContent = e.message; }
     });
   }
@@ -2208,8 +2238,12 @@
 
   // ---------- 库存管理 ----------
   async function renderInventory() {
-    $('#topbar-actions').innerHTML = `<label style="display:flex;align-items:center;gap:6px;font-size:13px;color:var(--text-soft)"><input type="checkbox" id="inv-low"> 仅看预警</label>`;
+    $('#topbar-actions').innerHTML = `<label style="display:flex;align-items:center;gap:6px;font-size:13px;color:var(--text-soft)"><input type="checkbox" id="inv-low"> 仅看预警</label>
+      <button class="btn-ghost" id="inv-export-stock" title="不含价格的盘点表，打印出来手填实盘数">⬇️ 盘点表</button>
+      <button class="btn-ghost" id="inv-export" title="含进价、售价与库存金额的完整清单">⬇️ 导出清单</button>`;
     $('#content').innerHTML = `<div class="card"><div id="inv-body" class="table-wrap"><p class="empty">加载中…</p></div></div>`;
+    $('#inv-export').onclick = (e) => exportInventory(e.currentTarget, 'full');
+    $('#inv-export-stock').onclick = (e) => exportInventory(e.currentTarget, 'stock');
     const load = debounce(async () => {
       const low = $('#inv-low').checked ? '1' : '';
       const rows = await api('GET', `/api/inventory?low=${low}`);
@@ -2223,6 +2257,28 @@
     }, 200);
     $('#inv-low').addEventListener('change', load);
     load();
+  }
+
+  // 库存导出：盘点表（无价格，可打印手填）与完整清单，跟随页面「仅看预警」
+  async function exportInventory(btn, mode) {
+    const low = $('#inv-low') && $('#inv-low').checked;
+    if (btn) btn.disabled = true;
+    try {
+      const qs = `?mode=${mode}${low ? '&low=1' : ''}`;
+      const res = await fetch('/api/inventory/export' + qs, { credentials: 'same-origin' });
+      if (!res.ok) {
+        let msg = '导出失败';
+        try { const d = await res.json(); msg = d.error || msg; } catch (e) { /* 忽略 */ }
+        throw new Error(msg);
+      }
+      const blob = await res.blob();
+      downloadBlob(blob, `${mode === 'stock' ? '库存盘点表' : '库存清单'}${low ? '_预警' : ''}_${fileStamp()}.xlsx`);
+      toast(mode === 'stock' ? '已导出盘点表（实盘数量列留空待填）' : '已导出库存清单');
+    } catch (e) {
+      toast(e.message, true);
+    } finally {
+      if (btn) btn.disabled = false;
+    }
   }
 
   function invTable(rows) {
@@ -2334,6 +2390,11 @@
   const monthStart = () => { const d = new Date(); return `${d.getFullYear()}-${pad2(d.getMonth() + 1)}-01`; };
   let reportFrom = monthStart();   // YYYY-MM-DD
   let reportTo = localDate();      // YYYY-MM-DD
+  // 单家往来流水账的日期段独立维护，且默认「不限」：
+  // 若沿用上面的当月默认值，一进流水账就只能看到本月，历史往来被静默裁掉。
+  let ledgerFrom = '';
+  let ledgerTo = '';
+  const isLedgerView = () => !!(reportDrill && (reportDrill.kind === 'supplier' || reportDrill.kind === 'customer'));
   function gotoReport(d) { reportDrill = d; renderReports(); }
 
   function repSummaryTable(rows, kind) {
@@ -2413,14 +2474,21 @@
     }).join('');
 
     if (!entries.length) return '<p class="empty">该单位暂无往来流水</p>';
+    // 筛选日期后：金额列合计只能算「本期间净额」，未结清余额是全量口径，必须分开说，
+    // 否则表尾会出现「合计 1 万 / 说明写未结清 0」这种自相矛盾。
+    const filtered = !!(d.range && d.range.filtered);
+    const shown = filtered ? r2((t.docTotal || 0) - (t.paidTotal || 0)) : bal;
+    const footNote = filtered
+      ? `本期间单据 ${yuan(t.docTotal)} − 已${isSup ? '付' : '收'} ${yuan(t.paidTotal)} = 期间净额；当前未结清 <b>${yuan(bal)}</b>（全量，含期间外往来）`
+      : `单据合计 ${yuan(t.docTotal)} − 已${isSup ? '付' : '收'} ${yuan(t.paidTotal)}${adv > 0.001 ? `（其中预存 ${yuan(adv)}）` : ''}`;
     return `
       <div class="table-wrap"><table>
         <thead><tr>${head}</tr></thead>
         <tbody>${body}</tbody>
         <tfoot><tr>
-          <td colspan="3"><b>合计（${entries.length} 笔）</b></td>
-          <td class="num"><b>${yuan(bal)}</b></td>
-          <td class="muted">单据合计 ${yuan(t.docTotal)} − 已${isSup ? '付' : '收'} ${yuan(t.paidTotal)}${adv > 0.001 ? `（其中预存 ${yuan(adv)}）` : ''}</td>
+          <td colspan="3"><b>${filtered ? `本期间合计（${entries.length} 笔）` : `合计（${entries.length} 笔）`}</b></td>
+          <td class="num"><b>${yuan(shown)}</b></td>
+          <td class="muted">${footNote}</td>
         </tr></tfoot>
       </table></div>`;
   }
@@ -2573,21 +2641,27 @@
   async function renderReports() {
     const top = $('#topbar-actions');
     const back = !!reportDrill;
+    const partyView = isLedgerView();
+    const dFrom = partyView ? ledgerFrom : reportFrom;
+    const dTo = partyView ? ledgerTo : reportTo;
     top.innerHTML = (back ? `<button class="btn-ghost" id="rep-back">← 返回</button>` : '') +
-      `<label class="period-label">起始</label><input type="date" id="rep-from" value="${reportFrom}" class="input-sm">
-       <label class="period-label">结束</label><input type="date" id="rep-to" value="${reportTo}" class="input-sm">
-       <button class="btn-primary small" id="rep-query">查询</button>
-       <button class="btn-ghost small" id="rep-export">导出 Excel</button>`;
+      `<label class="period-label">起始</label><input type="date" id="rep-from" value="${dFrom}" class="input-sm">
+       <label class="period-label">结束</label><input type="date" id="rep-to" value="${dTo}" class="input-sm">
+       <button class="btn-primary small" id="rep-query">查询</button>` +
+      (partyView ? `<button class="btn-ghost small" id="rep-export-ledger">⬇️ 导出路水账</button>` : '') +
+      `<button class="btn-ghost small" id="rep-export" title="导出整本经营报表：概览 / 应收 / 应付 / 采购 / 销售 / 库存 / 收付款 / 退单 / 改价">导出整本报表</button>`;
     const content = $('#content');
 
     // ---- 单家往来流水账 ----
+    const lqs = `from=${encodeURIComponent(ledgerFrom)}&to=${encodeURIComponent(ledgerTo)}`;
     if (reportDrill && reportDrill.kind === 'supplier') {
-      const d = await api('GET', `/api/reports/party/supplier/${reportDrill.id}/ledger`);
+      const d = await api('GET', `/api/reports/party/supplier/${reportDrill.id}/ledger?${lqs}`);
       const t = d.totals || {};
+      const inPeriod = !!(d.range && d.range.filtered);
       content.innerHTML = `
         <div class="grid cols-3">
-          <div class="stat"><div class="label">${esc(d.party.name)} · 累计采购（应付）</div><div class="value">${yuan(t.docTotal)}</div><div class="sub">约定定金合计 ${yuan(t.depositTotal)}</div></div>
-          <div class="stat good"><div class="label">累计已付</div><div class="value">${yuan(t.paidTotal)}</div><div class="sub">含定金与预付款${t.advance > 0.001 ? ` · 未抵用预存 ${yuan(t.advance)}` : ''}</div></div>
+          <div class="stat"><div class="label">${esc(d.party.name)} · 累计采购（应付）</div><div class="value">${yuan(t.allDocTotal)}</div><div class="sub">${inPeriod ? '本期间' : ''}约定定金 ${yuan(t.depositTotal)}</div></div>
+          <div class="stat good"><div class="label">累计已付</div><div class="value">${yuan(t.allPaidTotal)}</div><div class="sub">含定金与预付款${t.advance > 0.001 ? ` · 未抵用预存 ${yuan(t.advance)}` : ''}</div></div>
           <div class="stat warn"><div class="label">应付未付（未结清）</div><div class="value">${yuan(t.outstanding)}</div><div class="sub">与"总应付"口径一致</div></div>
         </div>
         <div class="card" style="margin-top:16px"><div class="card-title">${esc(d.party.name)} · 往来流水账（按时间倒序）</div>${partyLedgerView(d, 'supplier')}</div>`;
@@ -2596,12 +2670,13 @@
       return;
     }
     if (reportDrill && reportDrill.kind === 'customer') {
-      const d = await api('GET', `/api/reports/party/customer/${reportDrill.id}/ledger`);
+      const d = await api('GET', `/api/reports/party/customer/${reportDrill.id}/ledger?${lqs}`);
       const t = d.totals || {};
+      const inPeriod = !!(d.range && d.range.filtered);
       content.innerHTML = `
         <div class="grid cols-3">
-          <div class="stat"><div class="label">${esc(d.party.name)} · 累计销售（应收）</div><div class="value">${yuan(t.docTotal)}</div><div class="sub">约定定金合计 ${yuan(t.depositTotal)}</div></div>
-          <div class="stat good"><div class="label">累计已收</div><div class="value">${yuan(t.paidTotal)}</div><div class="sub">含定金与预收款${t.advance > 0.001 ? ` · 未抵用预存 ${yuan(t.advance)}` : ''}</div></div>
+          <div class="stat"><div class="label">${esc(d.party.name)} · 累计销售（应收）</div><div class="value">${yuan(t.allDocTotal)}</div><div class="sub">${inPeriod ? '本期间' : ''}约定定金 ${yuan(t.depositTotal)}</div></div>
+          <div class="stat good"><div class="label">累计已收</div><div class="value">${yuan(t.allPaidTotal)}</div><div class="sub">含定金与预收款${t.advance > 0.001 ? ` · 未抵用预存 ${yuan(t.advance)}` : ''}</div></div>
           <div class="stat warn"><div class="label">应收未收（未结清）</div><div class="value">${yuan(t.outstanding)}</div><div class="sub">与"总应收"口径一致</div></div>
         </div>
         <div class="card" style="margin-top:16px"><div class="card-title">${esc(d.party.name)} · 往来流水账（按时间倒序）</div>${partyLedgerView(d, 'customer')}</div>`;
@@ -2734,14 +2809,23 @@
 
     function bindPeriod() {
       const f = $('#rep-from'), t = $('#rep-to'), q = $('#rep-query');
-      if (f) f.onchange = (e) => { reportFrom = e.target.value; };
-      if (t) t.onchange = (e) => { reportTo = e.target.value; };
+      const pv = isLedgerView();
+      const setFrom = (v) => { if (pv) ledgerFrom = v; else reportFrom = v; };
+      const setTo = (v) => { if (pv) ledgerTo = v; else reportTo = v; };
+      if (f) f.onchange = (e) => setFrom(e.target.value);
+      if (t) t.onchange = (e) => setTo(e.target.value);
       if (q) q.onclick = () => {
-        if (reportFrom && reportTo && reportFrom > reportTo) return toast('起始日期不能晚于结束日期', true);
+        // 输入框改了但没触发 change（部分浏览器直接点按钮时）也要取到值
+        if (f) setFrom(f.value);
+        if (t) setTo(t.value);
+        const bad = pv ? (ledgerFrom && ledgerTo && ledgerFrom > ledgerTo) : (reportFrom && reportTo && reportFrom > reportTo);
+        if (bad) return toast('起始日期不能晚于结束日期', true);
         renderReports();
       };
       const ex = $('#rep-export');
       if (ex) ex.onclick = () => exportReportExcel(ex);
+      const exl = $('#rep-export-ledger');
+      if (exl) exl.onclick = () => exportPartyLedger(exl);
     }
   }
 
@@ -2766,6 +2850,29 @@
       a.remove();
       setTimeout(() => URL.revokeObjectURL(url), 4000);
       toast('已导出 Excel，请查看浏览器下载目录');
+    } catch (e) {
+      toast(e.message, true);
+    } finally {
+      if (btn) btn.disabled = false;
+    }
+  }
+
+  // 导出单家往来流水账：日期段与页面共用 ledgerFrom / ledgerTo，不会出现「屏幕筛了、导出没筛」
+  async function exportPartyLedger(btn) {
+    if (!reportDrill || (reportDrill.kind !== 'supplier' && reportDrill.kind !== 'customer')) return;
+    const kind = reportDrill.kind;
+    if (btn) btn.disabled = true;
+    try {
+      const qs = `?from=${encodeURIComponent(ledgerFrom)}&to=${encodeURIComponent(ledgerTo)}`;
+      const res = await fetch(`/api/reports/party/${kind}/${reportDrill.id}/ledger/export${qs}`, { credentials: 'same-origin' });
+      if (!res.ok) {
+        let msg = '导出失败';
+        try { const d = await res.json(); msg = d.error || msg; } catch (e) { /* 忽略 */ }
+        throw new Error(msg);
+      }
+      const blob = await res.blob();
+      downloadBlob(blob, `${kind === 'supplier' ? '供应商' : '客户'}往来流水账_${fileStamp()}.xlsx`);
+      toast('已导出往来流水账');
     } catch (e) {
       toast(e.message, true);
     } finally {
@@ -3134,6 +3241,205 @@
   //   ① 明细表套在 .table-scroll（max-height:460px）里，直接打印只会得到可见的十来行；
   //   ② 主页面有侧栏、统计卡、操作按钮列，都得靠 @media print 一个个藏，容易漏；
   //   ③ 独立窗口能自己定页边距、横向纸张、跨页重复表头，还能让用户另存为 PDF。
+  // 独立打印窗口：页面里的表格都套在 .table-scroll（max-height:460px）里，
+  // 直接 window.print() 只能印出屏幕上可见的十来行。生成自包含 HTML 后既能印全，
+  // 又能指定纸张方向、跨页重复表头，用户还可以直接「另存为 PDF」。
+  function openPrintWindow(html) {
+    const w = window.open('', '_blank');
+    if (!w) { toast('浏览器拦截了打印窗口，请允许本站弹窗后重试', true); return; }
+    w.document.open();
+    w.document.write(html);
+    w.document.close();
+    // 等一帧再唤起打印，避免部分浏览器在文档尚未就绪时打印出空白页
+    setTimeout(() => { try { w.focus(); w.print(); } catch (e) { /* 用户可能在打印前已关窗 */ } }, 350);
+  }
+
+  // 金额大写：正式单据上「1,234.00」和「壹仟贰佰叁拾肆元整」互相校验，防止手写改动。
+  // 不用网上流传的「逐位 + 单位表」写法——那类实现在「100.05」「1,002,000」上会漏掉中间的「零」，
+  // 印在单据上就是错票。这里改成按四位分节（个 / 万 / 亿），节内独立处理再补节间零。
+  function rmbUpper(n) {
+    const D = ['零', '壹', '贰', '叁', '肆', '伍', '陆', '柒', '捌', '玖'];
+    const raw = Number(n);
+    if (!isFinite(raw)) return '';
+    const neg = raw < 0;
+    const cents = Math.round(Math.abs(raw) * 100);   // 换成「分」做整数运算，避开浮点误差
+    if (cents === 0) return '零元整';
+    const yuan = Math.floor(cents / 100);
+    const jiao = Math.floor(cents / 10) % 10;
+    const fen = cents % 10;
+
+    const SEC = ['', '万', '亿', '万亿'];
+    const four = (v) => {           // 1..9999 → 仟佰拾个
+      const pos = ['仟', '佰', '拾', ''];
+      const ds = [Math.floor(v / 1000), Math.floor(v / 100) % 10, Math.floor(v / 10) % 10, v % 10];
+      let out = '';
+      let pendingZero = false;
+      for (let i = 0; i < 4; i++) {
+        if (ds[i] === 0) { if (out) pendingZero = true; }
+        else {
+          if (pendingZero) { out += '零'; pendingZero = false; }
+          out += D[ds[i]] + pos[i];
+        }
+      }
+      return out;
+    };
+
+    let intStr = '';
+    if (yuan > 0) {
+      const secs = [];
+      for (let y = yuan; y > 0; y = Math.floor(y / 10000)) secs.push(y % 10000);   // 低位在前
+      for (let i = secs.length - 1; i >= 0; i--) {   // 从高位往低位拼
+        const sec = secs[i];
+        if (sec === 0) {
+          // 整节为 0：只要更低位还有非零节，就留一个「零」占位（如 1,0000,0001）
+          if (secs.slice(0, i).some(v => v > 0) && intStr && !intStr.endsWith('零')) intStr += '零';
+          continue;
+        }
+        const prev = i + 1 < secs.length ? secs[i + 1] : 0;   // 更高一节的数值
+        // 两种情况要补零：本节缺千位（100|0002），或上一节以 0 结尾（100|2000）
+        if (intStr && (sec < 1000 || prev % 10 === 0) && !intStr.endsWith('零')) intStr += '零';
+        intStr += four(sec) + SEC[i];
+      }
+    }
+
+    let dec = '';
+    if (jiao === 0 && fen === 0) dec = '整';
+    else if (jiao === 0) dec = '零' + D[fen] + '分';
+    else dec = D[jiao] + '角' + (fen ? D[fen] + '分' : '整');
+
+    return (neg ? '负' : '') + (yuan > 0 ? intStr + '元' : '零元') + dec;
+  }
+
+  // 打印采购 / 销售单据（A4 纵向）：开单后交给客户的送货单、采购单都走这里
+  async function printDoc(kind, id) {
+    const isPur = kind === 'purchase' || kind === 'purchases';
+    let d;
+    try { d = await api('GET', `/api/${isPur ? 'purchases' : 'sales'}/${id}`); }
+    catch (e) { toast(e.message, true); return; }
+
+    const brand = (state.branding && state.branding.shopName) || '';
+    const title = isPur ? '采购入库单' : '销售出库单';
+    const who = isPur ? '供应商' : '客户';
+    const colPaid = isPur ? '已付' : '已收';
+    const colDue = isPur ? '未付' : '未收';
+    const party = isPur ? (d.supplier_name || '直采（未指定供应商）') : (d.customer_name || '散客');
+    const items = d.items || [];
+    const money = (v) => Number(v || 0).toLocaleString('zh-CN', { minimumFractionDigits: 2, maximumFractionDigits: 2 });
+    const total = Number(d.total_amount) || 0;
+    const paid = Number(d.paid) || 0;
+    const due = Number(d.outstanding) || 0;
+
+    const rows = items.map((it, i) => `<tr>
+      <td class="c">${i + 1}</td>
+      <td>${esc(it.product_name || '（该商品已删除）')}</td>
+      <td class="mono">${esc(it.sku || '')}</td>
+      <td class="c">${esc(it.unit || '')}</td>
+      <td class="num">${intf(it.qty)}</td>
+      <td class="num">${money(it.price)}</td>
+      <td class="num">${money(it.subtotal)}</td>
+    </tr>`).join('');
+
+    const statusText = d.status === 'returned' ? '已退单'
+      : (d.status === 'pending_return' ? '退单待审' : '');
+
+    const html = `<!doctype html><html lang="zh-CN"><head><meta charset="utf-8">
+<title>${esc((brand ? brand + ' · ' : '') + title + ' ' + d.bill_no)}</title>
+<style>
+  @page { size: A4 portrait; margin: 12mm; }
+  * { box-sizing: border-box; }
+  body { font-family: "Microsoft YaHei","PingFang SC","Hiragino Sans GB",sans-serif; color:#111; font-size:12px; margin:0; padding:10px; }
+  .head { display:flex; align-items:flex-end; justify-content:space-between; border-bottom:2px solid #333; padding-bottom:8px; margin-bottom:10px; }
+  h1 { font-size:20px; margin:0; letter-spacing:2px; }
+  .brand { font-size:13px; color:#444; margin-bottom:4px; }
+  .no { font-size:13px; text-align:right; line-height:1.7; }
+  .no b { font-size:15px; letter-spacing:.5px; }
+  .meta { display:flex; flex-wrap:wrap; gap:6px 24px; margin-bottom:10px; font-size:12.5px; }
+  .meta div { min-width:180px; }
+  .meta span { color:#666; }
+  table { width:100%; border-collapse:collapse; }
+  th, td { border:1px solid #999; padding:6px 7px; text-align:left; vertical-align:top; }
+  th { background:#f0f0f0; font-weight:600; }
+  td.c { text-align:center; }
+  td.num { text-align:right; white-space:nowrap; font-variant-numeric:tabular-nums; }
+  td.mono { font-family:Consolas,monospace; font-size:11px; color:#444; }
+  tfoot td { font-weight:700; background:#fafafa; }
+  .sum { margin-top:10px; display:flex; justify-content:space-between; gap:20px; }
+  .upper { font-size:12.5px; }
+  .upper b { letter-spacing:1px; }
+  .money { text-align:right; line-height:1.9; font-variant-numeric:tabular-nums; }
+  .money i { font-style:normal; color:#666; margin-right:6px; }
+  .note { margin-top:10px; font-size:12px; color:#333; }
+  .sign { margin-top:34px; display:flex; justify-content:space-between; gap:24px; font-size:12.5px; }
+  .sign div { flex:1; border-top:1px solid #999; padding-top:6px; }
+  .foot { margin-top:14px; color:#777; font-size:11px; display:flex; justify-content:space-between; }
+  .void { color:#c00; border:2px solid #c00; padding:1px 8px; font-size:12px; margin-left:8px; }
+  @media print { thead { display:table-header-group; } tr { page-break-inside:avoid; } }
+</style></head><body>
+<div class="head">
+  <div>
+    <div class="brand">${esc(brand || '进销存管理系统')}</div>
+    <h1>${title}${statusText ? `<span class="void">${statusText}</span>` : ''}</h1>
+  </div>
+  <div class="no">单号 <b>${esc(d.bill_no)}</b><br>${esc(String(d.created_at || '').replace('T', ' ').slice(0, 16))}</div>
+</div>
+<div class="meta">
+  <div><span>${who}：</span>${esc(party)}</div>
+  <div><span>制单人：</span>${esc(d.operator || '')}</div>
+  <div><span>商品项数：</span>${items.length} 项　<span>总件数：</span>${intf(items.reduce((s, x) => s + (Number(x.qty) || 0), 0))}</div>
+</div>
+<table>
+  <thead><tr>
+    <th class="c" style="width:38px">#</th><th>商品名称</th><th style="width:130px">SKU</th>
+    <th class="c" style="width:48px">单位</th><th class="num" style="width:64px">数量</th>
+    <th class="num" style="width:92px">单价（元）</th><th class="num" style="width:104px">金额（元）</th>
+  </tr></thead>
+  <tbody>${rows || '<tr><td colspan="7" class="c">无明细</td></tr>'}</tbody>
+  <tfoot><tr>
+    <td colspan="4">合计（${items.length} 项）</td>
+    <td class="num">${intf(items.reduce((s, x) => s + (Number(x.qty) || 0), 0))}</td>
+    <td></td><td class="num">${money(total)}</td>
+  </tr></tfoot>
+</table>
+<div class="sum">
+  <div class="upper">合计人民币（大写）：<b>${esc(rmbUpper(total))}</b></div>
+  <div class="money">
+    ${Number(d.deposit) > 0.001 ? `<div><i>约定定金</i>${money(d.deposit)}</div>` : ''}
+    <div><i>${colPaid}</i>${money(paid)}</div>
+    <div><i>${colDue}</i><b>${money(due)}</b></div>
+  </div>
+</div>
+${d.note ? `<div class="note">备注：${esc(d.note)}</div>` : ''}
+<div class="sign">
+  <div>制单人：${esc(d.operator || '')}</div>
+  <div>${isPur ? '送货人 / 收货人' : '送货人 / 客户签收'}：</div>
+  <div>日期：＿＿＿＿年＿＿月＿＿日</div>
+</div>
+<div class="foot"><span>打印时间：${esc(new Date().toLocaleString('zh-CN', { hour12: false }))}</span><span>${esc(brand || '')}</span></div>
+</body></html>`;
+    openPrintWindow(html);
+  }
+
+  // 开单成功后的确认屏：把「单号 / 合计 / 还欠多少」讲清，并给一键打印。
+  // 原来只有一句 toast，单据号一闪就没，想补打也无处可去。
+  function showDocDone(kind, res, bits) {
+    const isPur = kind === 'purchase';
+    const m = modal(`<div class="modal-head">
+        <div class="avatar">✅</div>
+        <div style="flex:1">
+          <div class="mt">${isPur ? '采购入库' : '销售出库'}成功</div>
+          <div class="ms">${esc(res.bill_no || '')} · 合计 ${yuan(res.total_amount)}</div>
+        </div>
+      </div>
+      ${bits.length ? `<ul class="due-list">${bits.map(b => `<li>${esc(b)}</li>`).join('')}</ul>` : ''}
+      <p class="muted" style="font-size:12.5px">之后要补打，可在「${isPur ? '供应商' : '客户'} → 点名称 → 交易清单」里找到这张单。</p>
+      <div class="modal-actions">
+        <button type="button" class="btn-ghost" id="dd-close">关闭</button>
+        <button type="button" class="btn-primary" id="dd-print">🖨 打印单据</button>
+      </div>`, 'modal-confirm');
+    m.root.querySelector('#dd-close').onclick = m.close;
+    m.root.querySelector('#dd-print').onclick = () => printDoc(kind, res.id);
+  }
+
   function printFinance(kind) {
     const isPur = kind === 'purchase';
     const list = isPur ? (state.cache.__purList || []) : (state.cache.__salList || []);
@@ -3201,13 +3507,7 @@
 <div class="foot">打印时间：${esc(new Date().toLocaleString('zh-CN', { hour12: false }))}</div>
 </body></html>`;
 
-    const w = window.open('', '_blank');
-    if (!w) { toast('浏览器拦截了打印窗口，请允许本站弹窗后重试', true); return; }
-    w.document.open();
-    w.document.write(html);
-    w.document.close();
-    // 等一帧再唤起打印，避免部分浏览器在文档尚未就绪时打印出空白页
-    setTimeout(() => { try { w.focus(); w.print(); } catch (e) { /* 用户可能在打印前已关窗 */ } }, 350);
+    openPrintWindow(html);
   }
 
   // 导出当前筛选结果：参数直接复用 finQuery()，与页面查询用的是同一份 URL 参数
@@ -3435,11 +3735,35 @@
           <div class="table-wrap"><table><thead><tr><th>时间</th><th>类型</th><th class="num">金额</th><th>分摊单据</th><th>本笔转预存</th><th>方式</th><th>备注</th><th>操作人</th></tr></thead><tbody>
             ${rows.length ? rows.map(txRow).join('') : '<tr><td colspan="8" class="empty">暂无收付款记录</td></tr>'}
           </tbody></table></div>
-        </div>`;
+        </div>
+        ${rows.length ? `<div class="modal-actions" style="justify-content:flex-start">
+          <button type="button" class="btn-ghost" id="lg-export">⬇️ 导出收付流水</button></div>` : ''}`;
+      const exBtn = body.querySelector('#lg-export');
+      if (exBtn) exBtn.onclick = () => exportPayLedger(exBtn, typeEl.value, pid);
     }
     typeEl.addEventListener('change', async () => { await loadParties(); await loadLedger(); });
     partyEl.addEventListener('change', loadLedger);
     (async () => { if (defType) typeEl.value = defType; await loadParties(); await loadLedger(); })();
+  }
+
+  // 收付流水账导出：带每笔的分摊单据与转预存，直接拿去和对方对账
+  async function exportPayLedger(btn, type, pid) {
+    if (btn) btn.disabled = true;
+    try {
+      const res = await fetch(`/api/party-ledger/export?party_type=${encodeURIComponent(type)}&party_id=${encodeURIComponent(pid)}`, { credentials: 'same-origin' });
+      if (!res.ok) {
+        let msg = '导出失败';
+        try { const d = await res.json(); msg = d.error || msg; } catch (e) { /* 忽略 */ }
+        throw new Error(msg);
+      }
+      const blob = await res.blob();
+      downloadBlob(blob, `收付流水账_${fileStamp()}.xlsx`);
+      toast('已导出收付流水账');
+    } catch (e) {
+      toast(e.message, true);
+    } finally {
+      if (btn) btn.disabled = false;
+    }
   }
 
   function advList(arr, kind) {
