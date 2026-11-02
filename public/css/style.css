@@ -512,6 +512,27 @@ td.num.up, td.num.down { font-size: 13px; font-weight: 600; }
 .log-note { max-width: 200px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .log-drift { margin-top: 10px; padding: 9px 12px; border-radius: 10px; background: #fffbeb; border: 1px solid #fde68a; font-size: 12.5px; color: #92400e; }
 
+/* 数据体检结果 */
+.hc-item { padding: 12px 14px; border: 1px solid var(--border); border-radius: 12px; margin-bottom: 10px; }
+.hc-head { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
+.hc-count { font-size: 12.5px; }
+.hc-detail { font-size: 12.5px; margin: 6px 0 8px; }
+.hc-scroll { max-height: 240px; }
+/* 体检表通常只有 3~5 列。用 table-layout:fixed + colgroup 定宽：
+   短枚举列（类型/方向）窄、数字列定宽右对齐、其余文本列平分剩余，
+   横向是一张规整的网格。默认 auto 布局会把剩余宽度全塞给某一列，
+   出现「一列撑得老宽、数字挤在最右」的散架感。 */
+.hc-table { width: 100%; table-layout: fixed; }
+.hc-table th, .hc-table td { padding: 8px 12px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.hc-col-n { width: 130px; }
+.hc-col-s { width: 110px; }
+/* 备注/建议这类长文本允许换行，避免内容被省略号吃光 */
+.hc-table th:last-child:not(.num), .hc-table td:last-child:not(.num) { white-space: normal; }
+@media (max-width: 768px) {
+  .hc-table { table-layout: auto; }
+  .hc-col-n, .hc-col-s { width: auto; }
+}
+
 /* 商品导入弹窗 */
 .import-box { display: flex; flex-direction: column; gap: 12px; }
 .import-box > .muted { font-size: 13px; line-height: 1.7; }

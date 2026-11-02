@@ -1005,16 +1005,47 @@
     // 数据体检：把「钱与货对不上」的典型症状一次查出来
     const hcBtn = $('#hc-run');
     if (hcBtn) {
+      // 每列：[字段, 表头, 宽度档位]。宽度档位决定列宽，缺省则平分剩余：
+      //   'n' = 数字/金额，右对齐、定宽；'s' = 类型/方向这类短枚举，窄列。
+      // 只给 td 加 num 而 th 不加，会出现「表头靠左、数字靠右」的错位，所以两者一起标。
       const HC_COLS = {
-        orphan_alloc: [['payment_id', '收付款#'], ['doc_type', '类型'], ['doc_id', '单据#'], ['amount', '金额']],
-        over_alloc: [['doc_type', '类型'], ['bill_no', '单号'], ['total_amount', '单据总额'], ['alloc', '已分摊']],
-        returned_alloc: [['bill_no', '单号'], ['doc_type', '类型'], ['amount', '分摊额']],
-        negative_stock: [['sku', 'SKU'], ['name', '商品'], ['stock', '库存']],
-        bad_total: [['doc_type', '类型'], ['bill_no', '单号'], ['total', '单据总额'], ['items_total', '明细合计']],
-        bad_payment: [['id', '#'], ['direction', '方向'], ['amount', '金额'], ['note', '备注']],
-        bad_alloc: [['id', '#'], ['payment_id', '收付款#'], ['amount', '金额']],
-        dangling_party: [['id', '#'], ['party_type', '类型'], ['party_id', '单位#'], ['amount', '金额']],
-        stock_drift: [['sku', 'SKU'], ['name', '商品'], ['stock', '当前库存'], ['flow', '流水累计'], ['diff', '差额']]
+        orphan_alloc: [['payment_id', '收付款#'], ['doc_type', '类型', 's'], ['doc_id', '单据#'], ['amount', '金额', 'n']],
+        over_alloc: [['doc_type', '类型', 's'], ['bill_no', '单号'], ['total_amount', '单据总额', 'n'], ['alloc', '已分摊', 'n']],
+        returned_alloc: [['bill_no', '单号'], ['doc_type', '类型', 's'], ['amount', '分摊额', 'n']],
+        negative_stock: [['sku', 'SKU', 's'], ['name', '商品'], ['stock', '库存', 'n']],
+        bad_total: [['doc_type', '类型', 's'], ['bill_no', '单号'], ['total', '单据总额', 'n'], ['items_total', '明细合计', 'n']],
+        bad_payment: [['id', '#', 's'], ['direction', '方向', 's'], ['amount', '金额', 'n'], ['note', '备注']],
+        bad_alloc: [['id', '#', 's'], ['payment_id', '收付款#'], ['amount', '金额', 'n']],
+        dangling_party: [['party_type', '类型', 's'], ['party_id', '单位#'], ['amount', '金额', 'n'], ['created_at', '时间']],
+        stock_drift: [['sku', 'SKU', 's'], ['name', '商品'], ['stock', '当前库存', 'n'], ['flow', '流水累计', 'n'], ['diff', '差额', 'n']],
+        // 下面三项原来漏配，导致查出问题时只剩标题和说明、明细表整块不显示
+        two_way: [['name', '往来单位'], ['party_type', '类型', 's'], ['outstanding', '欠款', 'n'], ['advance', '预存', 'n'], ['hint', '建议']],
+        negative_advance: [['name', '往来单位'], ['party_type', '类型', 's'], ['balance', '预存余额', 'n'], ['hint', '缺口']],
+        orphan_payment: [['id', '#', 's'], ['direction', '方向', 's'], ['amount', '金额', 'n'], ['alloc', '已分摊', 'n'], ['balance', '未分摊', 'n'], ['created_at', '时间']]
+      };
+      // 后端以后新增检查项时，前端没配列定义也不会静默丢掉整张表：按字段名兜底出表
+      const HC_LABEL = {
+        payment_id: '收付款#', doc_id: '单据#', doc_type: '类型', party_type: '类型', party_id: '单位#',
+        amount: '金额', bill_no: '单号', total_amount: '单据总额', alloc: '已分摊', sku: 'SKU',
+        name: '名称', stock: '库存', flow: '流水累计', diff: '差额', total: '单据总额',
+        items_total: '明细合计', id: '#', direction: '方向', note: '备注', created_at: '时间',
+        outstanding: '欠款', advance: '预存', balance: '余额', hint: '说明'
+      };
+      const HC_NUM = new Set(['amount', 'total_amount', 'alloc', 'stock', 'flow', 'diff', 'total', 'items_total', 'outstanding', 'advance', 'balance', 'party_id', 'doc_id', 'payment_id', 'id']);
+      const HC_SHORT = new Set(['doc_type', 'party_type', 'direction']);
+      const HC_TRANS = {
+        doc_type: { purchase: '采购单', sale: '销售单' },
+        party_type: { supplier: '供应商', customer: '客户' },
+        direction: { pay: '付款', receive: '收款' }
+      };
+      const hcCell = (k, v) => {
+        if (v == null || v === '') return '—';
+        const tr = HC_TRANS[k];
+        if (tr && tr[v]) return tr[v];
+        // 时间戳只保留到分钟，秒和毫秒在体检表里没有意义，还会把列撑宽
+        if (k === 'created_at') return String(v).replace('T', ' ').slice(0, 16);
+        if (typeof v === 'number') return v.toLocaleString('zh-CN', { maximumFractionDigits: 2 });
+        return String(v);
       };
       const LV = { error: ['danger', '需要处理'], warn: ['warn', '建议处理'], info: ['gray', '提示'] };
       const renderHc = (r) => {
@@ -1028,23 +1059,24 @@
         }
         return r.issues.map((it) => {
           const [cls, label] = LV[it.level] || LV.info;
-          const cols = HC_COLS[it.code] || [];
-          const head = cols.map(([, t]) => `<th>${esc(t)}</th>`).join('');
-          const DT = { purchase: '采购单', sale: '销售单' };
-          const body = it.items.map((row) => `<tr>${cols.map(([k]) => {
-            const raw = row[k];
-            const v = k === 'doc_type' ? (DT[raw] || raw) : raw;
-            const num = typeof v === 'number';
-            return `<td class="${num ? 'num' : ''}">${esc(num ? Number(v).toLocaleString('zh-CN') : String(v == null ? '—' : v))}</td>`;
-          }).join('')}</tr>`).join('');
-          return `<div style="padding:12px 14px;border:1px solid var(--border);border-radius:12px;margin-bottom:10px">
-            <div style="display:flex;align-items:center;gap:8px;flex-wrap:wrap">
+          let cols = HC_COLS[it.code];
+          if (!cols) {
+            cols = Object.keys(it.items[0] || {}).map(k => [k, HC_LABEL[k] || k,
+              HC_NUM.has(k) ? 'n' : (HC_SHORT.has(k) ? 's' : '')]);
+          }
+          // 定宽交给 colgroup：table-layout:fixed 下由它决定列宽，剩下没标档位的列平分剩余宽度
+          const colgroup = '<colgroup>' + cols.map(([, , w]) => `<col${w ? ` class="hc-col-${w}"` : ''}>`).join('') + '</colgroup>';
+          const head = cols.map(([, t, w]) => `<th class="${w === 'n' ? 'num' : ''}">${esc(t)}</th>`).join('');
+          const body = it.items.map((row) => `<tr>${cols.map(([k, , w]) =>
+            `<td class="${w === 'n' ? 'num' : ''}">${esc(hcCell(k, row[k]))}</td>`).join('')}</tr>`).join('');
+          return `<div class="hc-item">
+            <div class="hc-head">
               <span class="tag ${cls}">${label}</span>
               <b>${esc(it.title)}</b>
-              <span class="muted" style="font-size:12.5px">${it.count} 条${it.count > it.items.length ? `（仅显示前 ${it.items.length} 条）` : ''}</span>
+              <span class="muted hc-count">${it.count} 条${it.count > it.items.length ? `（仅显示前 ${it.items.length} 条）` : ''}</span>
             </div>
-            <p class="muted" style="font-size:12.5px;margin:6px 0 8px">${esc(it.detail)}</p>
-            ${cols.length ? `<div class="table-scroll" style="max-height:240px"><table class="log-table"><thead><tr>${head}</tr></thead><tbody>${body}</tbody></table></div>` : ''}
+            <p class="muted hc-detail">${esc(it.detail)}</p>
+            ${cols.length ? `<div class="table-scroll hc-scroll"><table class="log-table hc-table">${colgroup}<thead><tr>${head}</tr></thead><tbody>${body}</tbody></table></div>` : ''}
           </div>`;
         }).join('');
       };
