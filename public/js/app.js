@@ -2269,42 +2269,98 @@
   }
 
   // ---------- 库存管理 ----------
+  // 条件查询的当前值。重新渲染（如盘点调整后）时保留，不把用户填好的条件清掉
+  let invFilters = { sku: '', name: '', category: '', maxMin: '', status: 'all' };
+
+  // 把筛选条件拼成查询参数：列表与导出共用同一份，保证「看到的」和「导出的」一致
+  function invQuery() {
+    const p = new URLSearchParams();
+    if (invFilters.sku) p.set('sku', invFilters.sku);
+    if (invFilters.name) p.set('name', invFilters.name);
+    if (invFilters.category) p.set('category', invFilters.category);
+    if (invFilters.maxMin !== '') p.set('max_min', invFilters.maxMin);
+    if (invFilters.status && invFilters.status !== 'all') p.set('status', invFilters.status);
+    return p;
+  }
+
+  function invFilterBar() {
+    const cats = [...new Set((state.cache.products || []).map(p => p.category).filter(Boolean))]
+      .sort((a, b) => String(a).localeCompare(String(b), 'zh-CN'));
+    const catOpts = cats.map(c => `<option value="${esc(c)}"${invFilters.category === c ? ' selected' : ''}>${esc(c)}</option>`).join('');
+    const stOpts = [['all', '全部'], ['low', '预警（库存 ≤ 下限）'], ['normal', '正常']]
+      .map(([v, t]) => `<option value="${v}"${invFilters.status === v ? ' selected' : ''}>${t}</option>`).join('');
+    return `<div class="filter-bar">
+      <label>编码<input id="inv-sku" value="${esc(invFilters.sku)}" placeholder="模糊匹配"></label>
+      <label>名称<input id="inv-name" value="${esc(invFilters.name)}" placeholder="模糊匹配"></label>
+      <label>分类<select id="inv-cat"><option value="">全部分类</option>${catOpts}</select></label>
+      <label>下限小于<input id="inv-maxmin" type="number" min="0" step="1" value="${esc(invFilters.maxMin)}" placeholder="如 10"></label>
+      <label>状态<select id="inv-status">${stOpts}</select></label>
+      <button class="btn-primary small" id="inv-search">查询</button>
+      <button class="btn-ghost small" id="inv-reset">重置</button>
+    </div>`;
+  }
+
   async function renderInventory() {
-    $('#topbar-actions').innerHTML = `<label style="display:flex;align-items:center;gap:6px;font-size:13px;color:var(--text-soft)"><input type="checkbox" id="inv-low"> 仅看预警</label>
+    $('#topbar-actions').innerHTML = `
       <button class="btn-ghost" id="inv-export-stock" title="不含价格的盘点表，打印出来手填实盘数">⬇️ 盘点表</button>
       <button class="btn-ghost" id="inv-export" title="含进价、售价与库存金额的完整清单">⬇️ 导出清单</button>`;
-    $('#content').innerHTML = `<div class="card"><div id="inv-body" class="table-wrap"><p class="empty">加载中…</p></div></div>`;
+    $('#content').innerHTML = `<div class="card">${invFilterBar()}
+      <div id="inv-sum" class="inv-sum"></div>
+      <div id="inv-body" class="table-wrap"><p class="empty">加载中…</p></div></div>`;
     $('#inv-export').onclick = (e) => exportInventory(e.currentTarget, 'full');
     $('#inv-export-stock').onclick = (e) => exportInventory(e.currentTarget, 'stock');
-    const load = debounce(async () => {
-      const low = $('#inv-low').checked ? '1' : '';
-      const rows = await api('GET', `/api/inventory?low=${low}`);
-      $('#inv-body').innerHTML = invTable(rows);
+
+    const readFilters = () => {
+      invFilters = {
+        sku: $('#inv-sku').value.trim(),
+        name: $('#inv-name').value.trim(),
+        category: $('#inv-cat').value,
+        maxMin: $('#inv-maxmin').value.trim(),
+        status: $('#inv-status').value
+      };
+    };
+    const load = async () => {
+      const q = invQuery().toString();
+      const rows = await api('GET', '/api/inventory' + (q ? '?' + q : ''));
+      $('#inv-sum').textContent = rows.length
+        ? `共 ${rows.length} 种商品${q ? '（已按条件筛选）' : ''}`
+        : '';
+      $('#inv-body').innerHTML = invTable(rows, q ? '没有符合筛选条件的商品' : '暂无商品');
       $$('#inv-body tr[data-id]').forEach((tr) => {
         tr.querySelector('[data-act="lots"]').onclick = () => openLotsModal(tr.dataset.id);
         tr.querySelector('[data-act="adj"]').onclick = () => openAdjustModal(tr.dataset.id);
         const lg = tr.querySelector('[data-act="logs"]');
         if (lg) lg.onclick = () => openStockLogsModal(tr.dataset.id);
       });
-    }, 200);
-    $('#inv-low').addEventListener('change', load);
+    };
+    $('#inv-search').onclick = () => { readFilters(); load(); };
+    // 下拉类条件改了就查，输入框按回车查（避免每敲一个字打一次接口）
+    ['inv-cat', 'inv-status'].forEach((id) => { $('#' + id).onchange = () => { readFilters(); load(); }; });
+    ['inv-sku', 'inv-name', 'inv-maxmin'].forEach((id) => {
+      $('#' + id).addEventListener('keydown', (e) => { if (e.key === 'Enter') { readFilters(); load(); } });
+    });
+    $('#inv-reset').onclick = () => {
+      invFilters = { sku: '', name: '', category: '', maxMin: '', status: 'all' };
+      renderInventory();
+    };
     load();
   }
 
-  // 库存导出：盘点表（无价格，可打印手填）与完整清单，跟随页面「仅看预警」
+  // 库存导出：盘点表（无价格，可打印手填）与完整清单，跟随页面的条件查询
   async function exportInventory(btn, mode) {
-    const low = $('#inv-low') && $('#inv-low').checked;
     if (btn) btn.disabled = true;
     try {
-      const qs = `?mode=${mode}${low ? '&low=1' : ''}`;
-      const res = await fetch('/api/inventory/export' + qs, { credentials: 'same-origin' });
+      const p = invQuery();
+      const hasFilter = p.toString() !== '';
+      p.set('mode', mode);
+      const res = await fetch('/api/inventory/export?' + p.toString(), { credentials: 'same-origin' });
       if (!res.ok) {
         let msg = '导出失败';
         try { const d = await res.json(); msg = d.error || msg; } catch (e) { /* 忽略 */ }
         throw new Error(msg);
       }
       const blob = await res.blob();
-      downloadBlob(blob, `${mode === 'stock' ? '库存盘点表' : '库存清单'}${low ? '_预警' : ''}_${fileStamp()}.xlsx`);
+      downloadBlob(blob, `${mode === 'stock' ? '库存盘点表' : '库存清单'}${hasFilter ? '_筛选' : ''}_${fileStamp()}.xlsx`);
       toast(mode === 'stock' ? '已导出盘点表（实盘数量列留空待填）' : '已导出库存清单');
     } catch (e) {
       toast(e.message, true);
@@ -2313,8 +2369,8 @@
     }
   }
 
-  function invTable(rows) {
-    if (!rows.length) return '<p class="empty">暂无商品</p>';
+  function invTable(rows, emptyText) {
+    if (!rows.length) return `<p class="empty">${esc(emptyText || '暂无商品')}</p>`;
     return `<table><thead><tr><th>SKU</th><th>名称</th><th>分类</th><th class="num">库存</th><th class="num">下限</th><th>状态</th><th>操作</th></tr></thead><tbody>
       ${rows.map(p => `<tr data-id="${p.id}"><td>${esc(p.sku || '-')}</td><td>${esc(p.name)}</td><td>${esc(p.category || '-')}</td>
         <td class="num">${intf(p.stock)}</td><td class="num">${intf(p.min_stock)}</td>

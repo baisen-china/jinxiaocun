@@ -1778,13 +1778,49 @@ app.post('/api/sales/:id/return/approve', requireAdmin, (req, res) => returnAppr
 app.post('/api/sales/:id/return/reject', requireAdmin, (req, res) => returnRejectHandler('sale', parseInt(req.params.id), req, res));
 
 // ---------- 库存 ----------
+// 库存条件查询：页面与导出共用同一套解析，避免「看到的」和「导出的」不是同一批货。
+// 参数：sku / name（模糊）、category（精确）、max_min（下限严格小于 N）、
+//       status=low|normal|all，另兼容老的 low=1。
+function inventoryQuery(q) {
+  q = q || {};
+  const w = [], args = [];
+  const sku = String(q.sku || '').trim();
+  const name = String(q.name || '').trim();
+  const cat = String(q.category || '').trim();
+  if (sku) { w.push('sku LIKE ?'); args.push(`%${sku}%`); }
+  if (name) { w.push('name LIKE ?'); args.push(`%${name}%`); }
+  if (cat) { w.push('category = ?'); args.push(cat); }
+  // 「下限小于多少」按严格小于理解：填 10 表示下限低于 10 的商品
+  const maxMin = String(q.max_min == null ? '' : q.max_min).trim();
+  if (maxMin !== '') {
+    const v = Number(maxMin);
+    if (Number.isFinite(v)) { w.push('min_stock < ?'); args.push(v); }
+  }
+  let status = String(q.status || '').toLowerCase();
+  if (q.low === '1' || q.low === 'true') status = 'low';
+  if (status === 'low') w.push('stock <= min_stock');
+  else if (status === 'normal') w.push('stock > min_stock');
+  const where = w.length ? ` WHERE ${w.join(' AND ')}` : '';
+  return db.prepare(`SELECT * FROM products${where} ORDER BY stock <= min_stock, stock ASC, id DESC`).all(...args);
+}
+
+// 把筛选条件翻译成中文，写进导出文件的标题行
+function inventoryFilterText(q) {
+  q = q || {};
+  const bits = [];
+  if (String(q.sku || '').trim()) bits.push(`编码含「${String(q.sku).trim()}」`);
+  if (String(q.name || '').trim()) bits.push(`名称含「${String(q.name).trim()}」`);
+  if (String(q.category || '').trim()) bits.push(`分类「${String(q.category).trim()}」`);
+  if (String(q.max_min == null ? '' : q.max_min).trim() !== '') bits.push(`下限小于 ${String(q.max_min).trim()}`);
+  let status = String(q.status || '').toLowerCase();
+  if (q.low === '1' || q.low === 'true') status = 'low';
+  if (status === 'low') bits.push('仅库存预警');
+  else if (status === 'normal') bits.push('仅库存正常');
+  return bits.join('　');
+}
+
 app.get('/api/inventory', requireAuth, (req, res) => {
-  // low=1 时只返回库存已达下限的商品（前端「仅看预警」勾选框）
-  const low = req.query.low === '1' || req.query.low === 'true';
-  const rows = low
-    ? db.prepare('SELECT * FROM products WHERE stock <= min_stock ORDER BY stock ASC, id DESC').all()
-    : db.prepare('SELECT * FROM products ORDER BY stock <= min_stock, id DESC').all();
-  res.json(rows);
+  res.json(inventoryQuery(req.query));
 });
 
 app.get('/api/inventory/alerts', requireAuth, (req, res) => {
@@ -1793,14 +1829,11 @@ app.get('/api/inventory/alerts', requireAuth, (req, res) => {
 });
 
 // 库存导出：mode=stock 是「盘点表」（刻意不含价格，可以放心发给仓库手填）；
-// mode=full 是完整库存清单（含成本金额，给老板/会计看）。两者与页面共用 low 筛选。
+// mode=full 是完整库存清单（含成本金额，给老板/会计看）。两者与页面共用 inventoryQuery。
 app.get('/api/inventory/export', requireAuth, (req, res) => {
-  const low = req.query.low === '1' || req.query.low === 'true';
   const mode = String(req.query.mode || 'full').toLowerCase() === 'stock' ? 'stock' : 'full';
-  const rows = low
-    ? db.prepare('SELECT * FROM products WHERE stock <= min_stock ORDER BY stock ASC, id DESC').all()
-    : db.prepare('SELECT * FROM products ORDER BY stock <= min_stock, stock ASC, id DESC').all();
-  if (!rows.length) return res.status(400).json({ error: low ? '当前没有库存预警商品' : '还没有商品数据，无法导出' });
+  const rows = inventoryQuery(req.query);
+  if (!rows.length) return res.status(400).json({ error: '当前筛选条件下没有商品，无法导出' });
 
   const isStock = mode === 'stock';
   const head = isStock
@@ -1829,10 +1862,11 @@ app.get('/api/inventory/export', requireAuth, (req, res) => {
     : [['合计', `${rows.length} 种商品`, '', '', sumQty, '', '', '', r2(sumCost), r2(rows.reduce((s, p) => s + (Number(p.stock) || 0) * (Number(p.sale_price) || 0), 0)), '', '']];
 
   const title = isStock ? '库存盘点表' : '库存清单';
+  const ftxt = inventoryFilterText(req.query);
   const sheets = [{
     name: title,
     rows: [
-      [`${title}${low ? '（仅库存预警）' : ''}`],
+      [`${title}${ftxt ? `（${ftxt}）` : ''}`],
       [`导出时间：${nowLocal()}　｜　共 ${rows.length} 种商品${isStock ? '　｜　请按实际盘点数填写「实盘数量」，差异 = 实盘 − 账面' : `　｜　成本金额合计 ${r2(sumCost)}`}`],
       [],
       head,
@@ -1846,7 +1880,7 @@ app.get('/api/inventory/export', requireAuth, (req, res) => {
   try { buf = buildWorkbook(sheets); }
   catch (e) { return res.status(500).json({ error: '生成 Excel 失败：' + e.message }); }
   const stamp = db.prepare("SELECT strftime('%Y%m%d','now','localtime') AS d").get().d;
-  const fname = `${title}${low ? '_预警' : ''}_${stamp}.xlsx`;
+  const fname = `${title}${ftxt ? '_筛选' : ''}_${stamp}.xlsx`;
   res.setHeader('Content-Type', 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet');
   res.setHeader('Content-Disposition', `attachment; filename="inventory_${mode}_${stamp}.xlsx"; filename*=UTF-8''${encodeURIComponent(fname)}`);
   res.setHeader('Content-Length', buf.length);
