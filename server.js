@@ -2366,6 +2366,8 @@ app.post('/api/payments', requireAuth, (req, res) => {
   }
   let sumAlloc = 0;
   const validated = [];
+  // 分摊到的单据各自属于哪个往来单位：用于末尾判断「一笔钱是否横跨了两家」
+  const ownersOfDocs = new Set();
   for (const [key, aamt] of merged) {
     const [dt, idStr] = key.split(':');
     const did = parseInt(idStr);
@@ -2376,7 +2378,21 @@ app.post('/api/payments', requireAuth, (req, res) => {
     if (doc.status === 'returned') return res.status(400).json({ error: `单据 ${doc.bill_no} 已退单，不能${dt === 'purchase' ? '付款' : '收款'}` });
     if (doc.status === 'pending_return') return res.status(400).json({ error: `单据 ${doc.bill_no} 退单待审中，已锁定，不能${dt === 'purchase' ? '付款' : '收款'}` });
     const ownerId = dt === 'purchase' ? doc.supplier_id : doc.customer_id;
-    if (partyId && ownerId && ownerId !== partyId) return res.status(400).json({ error: '分摊单据与往来单位不匹配' });
+    // 归属必须严格对齐，两个方向都不能放过：
+    // ① 单据有归属 → 必须与本笔收付款的往来单位相同；
+    // ② 单据无归属（散客 / 直采）→ 本笔也不能指定往来单位。
+    // ② 是 2026-10-28「星河办公的收款替散客单结了 3,600」的成因：原来的条件写成
+    // `partyId && ownerId && ownerId !== partyId`，散客单 ownerId 为空，整条校验被短路跳过，
+    // 于是钱从甲家账上消失、替乙家消掉应收，两边同时对不上账，且事后极难发现。
+    if (ownerId && partyId && ownerId !== partyId) return res.status(400).json({ error: '分摊单据与往来单位不匹配' });
+    if (!ownerId && partyId) {
+      const who = dt === 'purchase' ? '供应商' : '客户';
+      const word = dt === 'purchase' ? '付款' : '收款';
+      return res.status(400).json({
+        error: `单据 ${doc.bill_no} 是${dt === 'purchase' ? '直采' : '散客'}单（未指定${who}），不能用指定${who}的${word}分摊；如确为${dt === 'purchase' ? '直采' : '散客'}交易，请重新录入一笔不指定${who}的${word}`
+      });
+    }
+    if (ownerId) ownersOfDocs.add(ownerId);
     const already = paidOf(dt, did);
     const remain = r2(doc.total_amount - already);
     if (remain <= 0.001) return res.status(400).json({ error: `单据 ${doc.bill_no} 已结清，不能再分摊` });
@@ -2385,6 +2401,11 @@ app.post('/api/payments', requireAuth, (req, res) => {
     validated.push({ doc_type: dt, doc_id: did, amount: aamt });
   }
   if (sumAlloc > amt + 0.001) return res.status(400).json({ error: '分摊合计不能超过本次收付款金额' });
+  // 一笔收付款只能对应一家：未指定单位的款项若被摊到两家的单据上，同样是把两家的钱混在一起，
+  // 之后无论怎么改归属都必有一边的账对不上，只能拆成两笔录入。
+  if (!partyId && ownersOfDocs.size > 1) {
+    return res.status(400).json({ error: '分摊到不同往来单位的单据不能合并为一笔收付款，请按往来单位分别录入' });
+  }
 
   // 兜底：若未传往来单位但已分摊单据，则从分摊单据反推归属
   // （否则预付款会因缺 party_id 而在下次交易时无法被自动抵扣）
@@ -4369,6 +4390,29 @@ app.get('/api/health/check', requireAdmin, (req, res) => {
             UNION ALL SELECT 'sale' AS dt, id, status, bill_no FROM sales) d
         ON d.dt=a.doc_type AND d.id=a.doc_id
       WHERE d.status='returned'`).all().map(r => ({ ...r, amount: r2(r.amount) })));
+
+  // 3b) 跨单位分摊：把甲单位的收款摊到乙单位（或散客/直采）的单据上。
+  //     后果是钱在甲家账上凭空消失、替乙家消掉欠款，两份报表同时算错，且从任何一张表上都看不出来。
+  //     早年录入端只校验了「两边都有归属且不相等」，单据无归属时整条校验被跳过，就是这类脏数据的来源；
+  //     现在录入时已按 400 拒绝，这条检查用来发现存量。
+  add('error', 'cross_party_alloc', '收付款分摊到了别的往来单位的单据',
+    '钱从一家的账上消失、替另一家消掉了欠款，两家报表同时对不上，且逐张表都看不出来。需按单据真实归属重录这笔收付款。',
+    db.prepare(`SELECT a.id, a.payment_id, a.doc_type, a.doc_id, a.amount, p.created_at,
+        COALESCE(pu.bill_no, s.bill_no) AS bill_no,
+        COALESCE(cu.name, su.name) AS doc_party_name,
+        COALESCE(pc.name, ps.name) AS pay_party_name
+      FROM payment_allocations a
+      JOIN payments p ON p.id = a.payment_id
+      LEFT JOIN purchases pu ON a.doc_type='purchase' AND pu.id = a.doc_id
+      LEFT JOIN sales s ON a.doc_type='sale' AND s.id = a.doc_id
+      LEFT JOIN customers cu ON s.customer_id = cu.id
+      LEFT JOIN suppliers su ON pu.supplier_id = su.id
+      LEFT JOIN customers pc ON p.party_type='customer' AND p.party_id = pc.id
+      LEFT JOIN suppliers ps ON p.party_type='supplier' AND p.party_id = ps.id
+      WHERE (pu.id IS NOT NULL OR s.id IS NOT NULL)
+        AND p.party_id IS NOT NULL
+        AND COALESCE(pu.supplier_id, s.customer_id) IS NOT p.party_id`).all()
+      .map(r => ({ ...r, amount: r2(r.amount), doc_party_name: r.doc_party_name || (r.doc_type === 'purchase' ? '直采（未指定）' : '散客（未指定）') })));
 
   // 4) 负库存（销售出库/退单/作废都可能把库存压到 0 以下）
   add('error', 'negative_stock', '商品库存为负', '库存为负说明出库多于入库，成本与利润都会失真。',

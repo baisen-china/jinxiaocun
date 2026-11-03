@@ -1049,6 +1049,7 @@
         orphan_alloc: [['payment_id', '收付款#'], ['doc_type', '类型', 's'], ['doc_id', '单据#'], ['amount', '金额', 'n']],
         over_alloc: [['doc_type', '类型', 's'], ['bill_no', '单号'], ['total_amount', '单据总额', 'n'], ['alloc', '已分摊', 'n']],
         returned_alloc: [['bill_no', '单号'], ['doc_type', '类型', 's'], ['amount', '分摊额', 'n']],
+        cross_party_alloc: [['bill_no', '单号'], ['doc_type', '类型', 's'], ['doc_party_name', '单据归属'], ['pay_party_name', '款项归属'], ['amount', '分摊额', 'n'], ['created_at', '时间']],
         negative_stock: [['sku', 'SKU', 's'], ['name', '商品'], ['stock', '库存', 'n']],
         bad_total: [['doc_type', '类型', 's'], ['bill_no', '单号'], ['total', '单据总额', 'n'], ['items_total', '明细合计', 'n']],
         bad_payment: [['id', '#', 's'], ['direction', '方向', 's'], ['amount', '金额', 'n'], ['note', '备注']],
