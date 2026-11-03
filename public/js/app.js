@@ -514,8 +514,9 @@
   const music = { box: null, audio: null, files: [], idx: 0, ready: false, loading: false };
   // 插播广播：与音乐播放状态无关，按间隔周期轮流播 Broadcast/guangbo-*.mp3。
   // 用「按墙钟累加经过时间」而非一次性长定时器：暂停/改间隔都不需要重排计时，天然不会漂移。
-  // files/idx 是「按顺序轮播」的游标：每次插播只播一条，下一次到点播下一条，播完一轮从头来。
-  const bc = { audio: null, info: null, files: [], idx: 0, playingName: '', timer: null, elapsed: 0, lastAt: 0, playing: false, resumeMusic: false, blocked: false, fetchedAt: 0 };
+  // files 是服务端排好的「一轮播放清单」（同一段广告词会重复出现，但不会连着播两次），
+  // pos 是清单里的游标：每次插播只播一条，下一次到点播下一条，播完一轮回到第一条。
+  const bc = { audio: null, info: null, files: [], pos: 0, playingPos: 0, sig: '', playingName: '', timer: null, elapsed: 0, lastAt: 0, playing: false, resumeMusic: false, blocked: false, fetchedAt: 0 };
 
   // 广播开关与间隔实时读配置，配置页保存后立刻生效（无需重建播放器）
   function bcOn() {
@@ -701,8 +702,9 @@
   // ---------- 插播广播 ----------
   // 广播开关**独立生效**：不论背景音乐是否在播（甚至音乐开关是关闭的），
   // 每累计满 interval 秒就播一条 Broadcast/guangbo-*.mp3；若此刻音乐正在播，先暂停它，广播结束再续播。
-  // 多条广播按文件名第二个数字的顺序轮流播（guangbo-1-1、guangbo-2-2、guangbo-3-3、guangbo-3-4…），
-  // 每次只播一条，下一次到点播下一条，一轮播完从头再来；目录为空则静默跳过，不打断任何东西。
+  // 多条广播按服务端排好的「一轮播放清单」轮流播：guangbo-词序号-本轮播放次数.mp3，
+  // 同一段内容一轮播 N 次但**不连着播**（如 1 播 2 次 + 2/3 各 1 次 → 1,2,1,3）。
+  // 每次只播一条，下一次到点播清单里的下一条，一轮播完从头再来；目录为空则静默跳过，不打断任何东西。
   function startBroadcastTimer() {
     if (bc.timer) return;
     bc.elapsed = 0;
@@ -738,11 +740,17 @@
     bc.lastAt = Date.now();
     bc.blocked = false;
     if (!bc.files.length || !bc.audio) { updateBcStatus(); return; }   // 没文件：跳过本次
-    const f = bc.files[bc.idx % bc.files.length];
+    const total = bc.files.length;
+    const pos = bc.pos % total;
+    const f = bc.files[pos];
     // 先把游标推到下一条：即使这一条文件损坏、或浏览器拒绝播放，下次也换一句，
     // 不会永远卡在同一句上（真卡住时表现就是「广播再也不响」，很难排查）。
-    bc.idx = (bc.idx + 1) % bc.files.length;
-    try { localStorage.setItem('bcNext', bc.files[bc.idx].name); } catch (e) { /* 隐私模式禁写，忽略 */ }
+    bc.pos = (pos + 1) % total;
+    bc.playingPos = pos + 1;
+    try {
+      localStorage.setItem('bcNextPos', String(bc.pos));
+      localStorage.setItem('bcSig', bc.sig);
+    } catch (e) { /* 隐私模式禁写，忽略 */ }
     bc.playing = true;
     bc.playingName = f.name;
     // 只有音乐此刻真的在播，广播结束后才需要续播；音乐没开就只是播完广播
@@ -797,17 +805,27 @@
     updateBcStatus();
   }
 
-  // 同步广播文件列表与播放游标。文件增删后按「下一条的文件名」重新定位，
+  // 同步播放清单与游标。清单变化后（增删/改名）按「上次播到第几个」重新定位，
   // 而不是把游标清零——否则每 60 秒一次的自动刷新都会让下一句跳回第一条，轮播就永远卡在开头。
+  // 清单可能含重复条目（同一段广告词一轮播多次），所以用「位置 + 清单指纹」恢复，
+  // 不能像以前那样只存文件名——重名时 findIndex 永远指向第一次出现的位置。
   function bcSyncFiles() {
-    const files = (bc.info && bc.info.files) || [];
-    bc.files = files;
-    if (!files.length) { bc.idx = 0; return; }
-    let name = '';
-    try { name = localStorage.getItem('bcNext') || ''; } catch (e) { /* 隐私模式禁读，忽略 */ }
-    let i = name ? files.findIndex(f => f.name === name) : -1;
-    if (i < 0) i = Math.min(bc.idx, files.length - 1);
-    bc.idx = i;
+    const info = bc.info;
+    const list = (info && (info.playlist && info.playlist.length ? info.playlist : info.files)) || [];
+    bc.files = list;
+    bc.sig = list.map(f => f.name).join(',');
+    if (!list.length) { bc.pos = 0; bc.sig = ''; return; }
+    let savedPos = -1, savedSig = '';
+    try {
+      savedPos = Number(localStorage.getItem('bcNextPos'));
+      savedSig = localStorage.getItem('bcSig') || '';
+    } catch (e) { /* 隐私模式禁读，忽略 */ }
+    if (savedSig === bc.sig && Number.isInteger(savedPos) && savedPos >= 0 && savedPos < list.length) {
+      bc.pos = savedPos;
+      return;
+    }
+    // 清单变了：沿用当前游标位置（越界则从头来），至少不会每次都重置
+    bc.pos = bc.pos < list.length ? bc.pos : 0;
   }
 
   function updateBcStatus() {
@@ -819,10 +837,9 @@
     const files = bc.files;
     const total = files.length;
     if (bc.playing) {
-      const n = files.findIndex(f => f.name === bc.playingName);
       // 侧栏这块很窄（约 130px），文案必须短：长句会被截断成「还有 2…」，反而看不清
-      el.textContent = total > 1 ? `📢 插播中 ${n >= 0 ? n + 1 : '—'}/${total}` : '📢 插播中…';
-      el.title = `正在播放 Broadcast/${bc.playingName}（共 ${total} 条，按顺序轮流播）`;
+      el.textContent = total > 1 ? `📢 插播中 ${bc.playingPos || '—'}/${total}` : '📢 插播中…';
+      el.title = `正在播放 Broadcast/${bc.playingName}（本轮共 ${total} 条，同一段内容不会连着播）`;
       return;
     }
     const info = bc.info;
@@ -839,9 +856,9 @@
     }
     // 倒计时向上取整：只显示整数秒，且不会出现「还有 0 秒」却仍在等待的情况
     const left = Math.max(0, Math.ceil(iv - bc.elapsed));
-    const next = files[bc.idx % total];
-    el.textContent = `📢 下一句 ${bc.idx + 1}/${total} · ${left} 秒`;
-    el.title = `每 ${iv} 秒插播一条；下一句 Broadcast/${next ? next.name : '—'}（共 ${total} 条按顺序轮流播）`;
+    const next = files[bc.pos % total];
+    el.textContent = `📢 下一句 ${bc.pos + 1}/${total} · ${left} 秒`;
+    el.title = `每 ${iv} 秒插播一条；下一句 Broadcast/${next ? next.name : '—'}（本轮共 ${total} 条，同一段内容不会连着播）`;
   }
 
   // ---------- 系统配置（管理员） ----------
@@ -926,8 +943,8 @@
       </div>
       <div class="card" style="margin-top:16px">
         <div class="card-title">插播广播</div>
-        <p class="settings-desc">开启后，每到一个间隔周期就插播一条广播：若此刻背景音乐正在播放，会先暂停音乐、广播播完自动接着放；音乐没在播（甚至音乐开关关闭）也照常按周期插播。广播文件放在系统根目录下的 <code>Broadcast</code> 文件夹，<b>条数不限</b>，文件名格式为 <code>guangbo-词序号-本轮位置.mp3</code>，两个数字都是 1~9：第一个数字表示这是第几条广播词，第二个数字表示这一句在本轮插播里排第几个，播放顺序只看第二个数字。<br>
-        例如一共有 3 句广播词、一轮排 4 条、第 3 句要播两次，就放 <code>guangbo-1-1.mp3</code>、<code>guangbo-2-2.mp3</code>、<code>guangbo-3-3.mp3</code>、<code>guangbo-3-4.mp3</code>。每次只播一条，下一次到点播下一条，一轮播完从头再来；拷进目录即生效，无需重启（最长约 1 分钟自动识别）。</p>
+        <p class="settings-desc">开启后，每到一个间隔周期就插播一条广播：若此刻背景音乐正在播放，会先暂停音乐、广播播完自动接着放；音乐没在播（甚至音乐开关关闭）也照常按周期插播。广播文件放在系统根目录下的 <code>Broadcast</code> 文件夹，<b>条数不限</b>，文件名格式为 <code>guangbo-词序号-本轮播放次数.mp3</code>，两个数字都是 1~9：第一个数字表示这是第几条广播词，第二个数字表示这一段内容在一轮插播里要播<b>几次</b>（不是排第几个；同一句只放一个文件即可）。<br>
+        例如 3 句广播词、第 1 句要播 2 次（一轮共 4 条），只需放 <code>guangbo-1-2.mp3</code>、<code>guangbo-2-1.mp3</code>、<code>guangbo-3-1.mp3</code>，实际播放顺序为 <b>1 → 2 → 1 → 3</b>：同一段内容不会连着播两次。每次只播一条，下一次到点播下一条，一轮播完从头再来；拷进目录即生效，无需重启（最长约 1 分钟自动识别）。</p>
         <div class="chk-list">
           <label class="chk-row">
             <input type="checkbox" id="set-bc" ${bcfg.enabled ? 'checked' : ''}>
@@ -994,11 +1011,14 @@
       try {
         const bi = await api('GET', '/api/broadcast/info');
         const list = bi.files || [];
+        const play = bi.playlist && bi.playlist.length ? bi.playlist : list;
         if (!list.length) {
           hint.textContent = '⚠️ 未找到 Broadcast/guangbo-*.mp3，插播将自动跳过';
         } else {
-          const names = list.slice(0, 8).map(f => `<code>${esc(f.name)}</code>`).join(' → ');
-          hint.innerHTML = `✅ 已识别 ${list.length} 条，轮播顺序：${names}${list.length > 8 ? ` …（共 ${list.length} 条）` : ''}`;
+          // 展示的是「一轮实际播放顺序」（含同一段广告词的重复次数），而不是文件名清单，
+          // 这样管理员一眼就能核对「第 3 条是不是真的播了 2 次、有没有连着播」。
+          const shown = play.slice(0, 12).map(f => `<code>${esc(f.name)}</code>`).join(' → ');
+          hint.innerHTML = `✅ 已识别 ${list.length} 个文件，一轮共 ${play.length} 条，播放顺序：${shown}${play.length > 12 ? ` …（后面还有 ${play.length - 12} 条）` : ''}`;
         }
       } catch (e) { hint.textContent = '广播文件状态读取失败'; }
     })();

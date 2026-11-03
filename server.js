@@ -546,19 +546,22 @@ app.get('/mp3/:file', requireAuth, (req, res) => {
 });
 
 // ---------- 插播广播（目录固定为项目根目录下 Broadcast/） ----------
-// 文件名规则：guangbo-<广播词序号>-<本轮第几条>.mp3，两个数字都可以是 1~9（写更大也行，按数值排）。
-//   第一个数字 = 这是第几条广播词（内容编号，仅用于标识这是哪一句）；
-//   第二个数字 = 这句在「一轮插播」里排第几个，播放顺序只看它。
-//   例：一共有 3 句广播词、一轮排 4 条，第 3 句要播两次，就放：
-//       guangbo-1-1.mp3、guangbo-2-2.mp3、guangbo-3-3.mp3、guangbo-3-4.mp3
-//   每次插播只播一条，下一轮到点播下一条，播完一轮从头再来。
+// 文件名规则：guangbo-<广播词序号>-<本轮播放次数>.mp3，两个数字都可以是 1~9（写更大也行，按数值处理）。
+//   第一个数字 = 这是第几条广播词（同一段内容）；
+//   第二个数字 = 这一段内容在「一轮插播」里要播几次（不是排第几个）。
+//   例：3 句广播词、第 1 句播 2 次（一轮共 4 条），只要放：
+//       guangbo-1-2.mp3、guangbo-2-1.mp3、guangbo-3-1.mp3
+//   系统据此排出一轮清单 1 → 2 → 1 → 3：同一段内容不会连着播两次。
+//   每次插播只播一条，下一轮到点播清单里的下一条，播完一轮从头再来。
 // 兼容旧版单文件 guangbo.mp3（当作 1-1），已部署的机器不用改文件名也能继续用。
 // 接口不接收任意路径：音频请求只接受「目录扫描白名单里的文件名」，从根上排除路径穿越。
 const BROADCAST_DIR = path.join(__dirname, 'Broadcast');
 const BROADCAST_RE = /^guangbo(?:-(\d+)-(\d+))?\.mp3$/i;
 try { fs.mkdirSync(BROADCAST_DIR, { recursive: true }); } catch (e) { /* 创建失败不阻断启动，前端会提示缺少文件 */ }
 
-// 扫描目录并按「第二个数字（轮次位置）→ 第一个数字（词序号）→ 文件名」排序
+// 扫描目录并按「词序号（第几条广告词）→ 文件名」排序。
+// 注意：排序**不能**先按第二个数字（播放次数）——那会把「1-2」排到「2-1」后面，
+// 等于把第 1 条广告词的第 2 次播放拆到别的广告词之间，一轮播下来既不对次数也不对顺序。
 function broadcastFiles() {
   let names = [];
   try { names = fs.readdirSync(BROADCAST_DIR); } catch (e) { return []; }
@@ -582,7 +585,7 @@ function broadcastFiles() {
   // 旧的裸 guangbo.mp3 只在「目录里还没有任何 guangbo-N-N.mp3」时才顶上，
   // 否则它会和 guangbo-1-1.mp3 撞成同一条（order/seq 都是 1），一轮里被播两遍。
   const list = out.length ? out : legacy;
-  list.sort((a, b) => (a.seq - b.seq) || (a.order - b.order) || a.name.localeCompare(b.name));
+  list.sort((a, b) => (a.order - b.order) || (a.seq - b.seq) || a.name.localeCompare(b.name));
   return list.map(f => ({
     ...f,
     // 版本号带上大小 + 修改时间：替换同名文件后浏览器不会命中旧音频缓存
@@ -590,16 +593,64 @@ function broadcastFiles() {
   }));
 }
 
+// 把「每条广告词播几次」展开成一整轮的播放清单（前端按 pos 顺序播，播完回到第一条）。
+//
+// 规则（对应文件名 guangbo-词序号-播放次数.mp3）：
+//   · 同一个词序号 = 同一段内容；它的 seq 就是「这一轮里要播几次」（同组多个文件取最大值，
+//     多出来的文件当成这段内容的备选录音，按 seq 顺序轮着用）。
+//   · **同一段内容不连续播**：每一步都从「还没播够次数、且不是刚播过的那条」里挑，
+//     剩余次数多的优先（避免前面播完了、只剩一条在后面连着播），同票按词序号。
+//     例：1 播 2 次、2 和 3 各播 1 次 → 1 → 2 → 1 → 3，而不是 1 → 1 → 2 → 3。
+//   · 只剩一条可选时（例如 1 要播 2 次、另一条只播 1 次）才允许连续，这是数学上躲不开的。
+function broadcastPlaylist(files) {
+  const groups = new Map();
+  for (const f of files) {
+    if (!groups.has(f.order)) groups.set(f.order, { order: f.order, need: 0, files: [] });
+    const g = groups.get(f.order);
+    g.need = Math.max(g.need, Math.max(1, f.seq || 1));
+    g.files.push(f);
+  }
+  const gs = [...groups.values()].sort((a, b) => a.order - b.order);
+  for (const g of gs) g.files.sort((a, b) => (a.seq - b.seq) || a.name.localeCompare(b.name));
+  const left = new Map(gs.map(g => [g.order, g.need]));
+  const total = gs.reduce((s, g) => s + g.need, 0);
+  const out = [];
+  let lastOrder = null;
+  for (let i = 0; i < total; i++) {
+    let cands = gs.filter(g => left.get(g.order) > 0 && g.order !== lastOrder);
+    if (!cands.length) cands = gs.filter(g => left.get(g.order) > 0);   // 无可奈何才连续
+    cands.sort((a, b) => (left.get(b.order) - left.get(a.order)) || (a.order - b.order));
+    const pick = cands[0];
+    if (!pick) break;
+    const used = pick.need - left.get(pick.order);        // 本组已经播过几次（0 起）
+    const file = pick.files[used % pick.files.length];
+    out.push({
+      ...file,
+      pos: out.length + 1,        // 本轮第几个
+      round: total,               // 本轮共几个
+      occurrence: used + 1,       // 该条广告词本轮的第几次
+      need: pick.need
+    });
+    left.set(pick.order, left.get(pick.order) - 1);
+    lastOrder = pick.order;
+  }
+  return out;
+}
+
 function broadcastInfo() {
   const s = getSettings().broadcast;
   const files = broadcastFiles();
+  const playlist = broadcastPlaylist(files);
   return {
     enabled: s.enabled,
     interval: s.interval,
     dir: 'Broadcast',
-    pattern: 'guangbo-词序号-本轮位置.mp3',
+    pattern: 'guangbo-词序号-本轮播放次数.mp3',
     files,
     count: files.length,
+    // 播放清单（已按「同一段内容不连续」排好，长度为一条广告词播几次的总和）
+    playlist,
+    round: playlist.length,
     // 旧字段保留：单文件时代前端读的是 exists / url / file，这里指向第一条
     exists: files.length > 0,
     file: files.length ? files[0].name : '',
