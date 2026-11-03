@@ -238,10 +238,8 @@ CREATE INDEX IF NOT EXISTS idx_price_logs_type ON price_logs(log_type);
 -- 明细表按所属单据取数（单据详情、财务明细的数量统计）走索引，避免全表扫描
 CREATE INDEX IF NOT EXISTS idx_purchase_items_pid ON purchase_items(purchase_id);
 CREATE INDEX IF NOT EXISTS idx_sale_items_sid ON sale_items(sale_id);
--- 往来账高频过滤：供应商/客户明细按归属单位+方向聚合、应收应付按"单位+状态"筛选
+-- 往来账高频过滤：供应商/客户明细按归属单位+方向聚合
 CREATE INDEX IF NOT EXISTS idx_payments_party ON payments(party_type, party_id, direction);
-CREATE INDEX IF NOT EXISTS idx_sales_customer_status ON sales(customer_id, status);
-CREATE INDEX IF NOT EXISTS idx_purchases_supplier_status ON purchases(supplier_id, status);
 `);
 
 // 判定是否为空库（新装）：在建表之后、seed 之前判定，供时区迁移判断是否需要平移历史数据
@@ -369,6 +367,14 @@ function migrateReturnStatus() {
   }
 }
 migrateReturnStatus();
+
+// 依赖 status 列的两个复合索引，必须放在 migrateReturnStatus 之后建：
+// 老库靠历史迁移早已补上 status 列，而**全新空库**是在 migrateReturnStatus 里才 ALTER TABLE 加列，
+// 若在最初的建表 exec 里就建这两个索引，空库首次启动会因 "no such column: status" 直接崩溃。
+db.exec(`
+CREATE INDEX IF NOT EXISTS idx_sales_customer_status ON sales(customer_id, status);
+CREATE INDEX IF NOT EXISTS idx_purchases_supplier_status ON purchases(supplier_id, status);
+`);
 
 // 迁移：为采购/销售单补充「退单审批」相关字段（幂等）
 // 退单审批流：active(正常) -> pending_return(普通用户申请退单、已锁定、待管理员审批) -> returned(管理员审批通过、已真正退单)

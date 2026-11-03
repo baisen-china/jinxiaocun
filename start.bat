@@ -36,6 +36,17 @@ echo 未找到 node.exe，请先安装 Node.js 或确认其在 PATH 中。
 pause
 exit /b 1
 
+REM 首次解压或换了 Node 版本导致依赖缺失时，自动安装（需联网）
+if not exist node_modules (
+  echo 检测到依赖未安装，正在执行 npm install（首次需联网，请稍候）...
+  call npm install
+  if errorlevel 1 (
+    echo 依赖安装失败：请确认已安装 Node.js 并能访问网络，或手动运行 npm install。
+    pause
+    exit /b 1
+  )
+)
+
 :run
 start http://127.0.0.1:3000
 "%NODE%" server.js
