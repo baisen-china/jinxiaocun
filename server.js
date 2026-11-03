@@ -1043,12 +1043,43 @@ app.delete('/api/products/:id', requireAdmin, (req, res) => {
 });
 
 // ---------- 供应商 ----------
-app.get('/api/suppliers', requireAuth, (req, res) => {
-  const { search } = req.query;
+// 列表查询抽成函数：页面（/api/suppliers）与导出（/api/suppliers/export）共用同一份 SQL，
+// 避免「屏幕上筛出来的」和「导出的 Excel」不是同一批数据、甚至顺序都不同。
+function supplierList(search) {
   let sql = 'SELECT * FROM suppliers WHERE 1=1'; const params = [];
   if (search) { sql += ' AND (name LIKE ? OR contact LIKE ? OR phone LIKE ?)'; const s = `%${search}%`; params.push(s, s, s); }
   sql += ' ORDER BY id DESC';
-  res.json(db.prepare(sql).all(...params));
+  return db.prepare(sql).all(...params);
+}
+
+app.get('/api/suppliers', requireAuth, (req, res) => res.json(supplierList(String(req.query.search || '').trim())));
+
+// 导出供应商清单（仅管理员）：列顺序与页面表格一致
+app.get('/api/suppliers/export', requireAuth, (req, res) => {
+  if (!isAdminSession(req)) return res.status(403).json({ error: '仅管理员可导出供应商清单' });
+  const search = String(req.query.search || '').trim();
+  const rows = supplierList(search);
+  if (!rows.length) return res.status(400).json({ error: '当前筛选条件下没有供应商，无法导出' });
+  const body = rows.map((s, i) => [i + 1, s.name || '', s.contact || '', s.phone || '', s.address || '', s.note || '']);
+  const sheets = [{
+    name: '供应商清单',
+    rows: [
+      ['供应商清单'],
+      [`导出时间：${nowLocal()}　｜　共 ${rows.length} 家供应商${search ? `　｜　搜索：${search}` : ''}`],
+      [],
+      ['序号', '供应商名称', '联系人', '电话', '地址', '备注'],
+      ...body
+    ]
+  }];
+  let buf;
+  try { buf = buildWorkbook(sheets); }
+  catch (e) { return res.status(500).json({ error: '生成 Excel 失败：' + e.message }); }
+  const stamp = db.prepare("SELECT strftime('%Y%m%d','now','localtime') AS d").get().d;
+  const fname = `供应商清单_${stamp}.xlsx`;
+  res.setHeader('Content-Type', 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet');
+  res.setHeader('Content-Disposition', `attachment; filename="suppliers_${stamp}.xlsx"; filename*=UTF-8''${encodeURIComponent(fname)}`);
+  res.setHeader('Content-Length', buf.length);
+  res.end(buf);
 });
 
 app.post('/api/suppliers', requireAuth, (req, res) => {
@@ -1089,8 +1120,9 @@ app.delete('/api/suppliers/:id', requireAuth, (req, res) => {
 
 // ---------- 客户 ----------
 // 返回客户列表，并附带「当前应收」「授信额度」「可用额度」
-app.get('/api/customers', requireAuth, (req, res) => {
-  const { search } = req.query;
+// 客户列表：返回客户基本信息 + 「当前应收」「授信额度」「预收款」「可用额度」。
+// 抽成函数供页面（/api/customers）与导出（/api/customers/export）共用，口径只维护一份。
+function customerList(search) {
   let where = 'WHERE 1=1'; const params = [];
   if (search) { where += ' AND (c.name LIKE ? OR c.contact LIKE ? OR c.phone LIKE ?)'; const s = `%${search}%`; params.push(s, s, s); }
   // 应收只排除「已退单」：退单待审（pending_return）的货还没退、钱也没退，
@@ -1103,7 +1135,7 @@ app.get('/api/customers', requireAuth, (req, res) => {
     GROUP BY c.id
     ORDER BY c.id DESC`;
   const advMap = advanceMapOf('customer');
-  const rows = db.prepare(sql).all(...params).map(r => {
+  return db.prepare(sql).all(...params).map(r => {
     const limit = r.credit_limit == null ? 100000 : r2(r.credit_limit);
     const receivable = r2(r.receivable);
     const advance = advMap.get(r.id) || 0;
@@ -1111,7 +1143,43 @@ app.get('/api/customers', requireAuth, (req, res) => {
     const used = Math.max(0, r2(receivable - advance));
     return { ...r, credit_limit: limit, receivable, advance, credit_used: used, available: r2(limit - used) };
   });
-  res.json(rows);
+}
+
+app.get('/api/customers', requireAuth, (req, res) => res.json(customerList(String(req.query.search || '').trim())));
+
+// 导出客户清单（仅管理员）：与页面同一份查询，含授信 / 应收 / 预收款 / 可用额度
+app.get('/api/customers/export', requireAuth, (req, res) => {
+  if (!isAdminSession(req)) return res.status(403).json({ error: '仅管理员可导出客户清单' });
+  const search = String(req.query.search || '').trim();
+  const rows = customerList(search);
+  if (!rows.length) return res.status(400).json({ error: '当前筛选条件下没有客户，无法导出' });
+  const body = rows.map((c, i) => [
+    i + 1, c.name || '', c.contact || '', c.phone || '', c.address || '', c.note || '',
+    r2(c.credit_limit), r2(c.receivable), r2(c.advance), r2(c.available),
+    c.credit_used > r2(c.credit_limit) + 0.001 ? '超授信' : '正常'
+  ]);
+  const sum = (k) => r2(rows.reduce((s, x) => s + (Number(x[k]) || 0), 0));
+  const sheets = [{
+    name: '客户清单',
+    rows: [
+      ['客户清单'],
+      [`导出时间：${nowLocal()}　｜　共 ${rows.length} 家客户${search ? `　｜　搜索：${search}` : ''}`],
+      [],
+      ['序号', '客户名称', '联系人', '电话', '地址', '备注', '授信额度', '当前应收', '预收款', '可用额度', '授信状态'],
+      ...body,
+      [],
+      ['合计', `${rows.length} 家客户`, '', '', '', '', sum('credit_limit'), sum('receivable'), sum('advance'), sum('available'), '']
+    ]
+  }];
+  let buf;
+  try { buf = buildWorkbook(sheets); }
+  catch (e) { return res.status(500).json({ error: '生成 Excel 失败：' + e.message }); }
+  const stamp = db.prepare("SELECT strftime('%Y%m%d','now','localtime') AS d").get().d;
+  const fname = `客户清单_${stamp}.xlsx`;
+  res.setHeader('Content-Type', 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet');
+  res.setHeader('Content-Disposition', `attachment; filename="customers_${stamp}.xlsx"; filename*=UTF-8''${encodeURIComponent(fname)}`);
+  res.setHeader('Content-Length', buf.length);
+  res.end(buf);
 });
 
 // 解析「授信额度（赊货金额）」：允许 0（表示禁止赊账），不允许负数或非法数值
@@ -3405,10 +3473,17 @@ function computeArAp() {
     FROM sales s WHERE s.customer_id IS NULL AND (s.status IS NULL OR s.status != 'returned')`).get();
 
   const sum = (arr, k) => arr.reduce((s, x) => s + r2(x[k] || 0), 0);
-  const sup = suppliers.map(s => ({ id: s.id, name: s.name, total: r2(s.total), paid: r2(s.total - s.payable), payable: r2(s.payable) }));
+  // 预付款 = 已付给供应商、但还没分摊到任何采购单的钱（多付/预付）。
+  // 它跟「应付」是两笔不同性质的钱：应付是我欠他，预付款是我先给了他、货/单还没到位。
+  // 报表上必须单列，否则老板只看到「应付 8 万」会以为还要再掏 8 万，其实账上还压着几万预付款。
+  const advSup = advanceMapOf('supplier');
+  const sup = suppliers.map(s => ({
+    id: s.id, name: s.name, total: r2(s.total), paid: r2(s.total - s.payable), payable: r2(s.payable),
+    advance: advSup.get(s.id) || 0
+  }));
   // 直采单独成行（id=0 表示「未指定供应商」，点击可下钻查看明细）
   if (r2(direct.total) > 0.001 || r2(direct.payable) > 0.001) {
-    sup.push({ id: 0, name: '直采（未指定供应商）', total: r2(direct.total), paid: r2(direct.total - direct.payable), payable: r2(direct.payable), unlinked: true });
+    sup.push({ id: 0, name: '直采（未指定供应商）', total: r2(direct.total), paid: r2(direct.total - direct.payable), payable: r2(direct.payable), advance: 0, unlinked: true });
   }
   const advCus = advanceMapOf('customer');
   const cus = customers.map(c => {
@@ -3425,15 +3500,19 @@ function computeArAp() {
   });
   // 散客单独成行（id=0 表示「未指定客户」，点击可下钻查看明细）
   if (r2(retail.total) > 0.001 || r2(retail.receivable) > 0.001) {
-    cus.push({ id: 0, name: '散客（未指定客户）', total: r2(retail.total), received: r2(retail.total - retail.receivable), receivable: r2(retail.receivable), credit_limit: null, over_limit: false, unlinked: true });
+    cus.push({ id: 0, name: '散客（未指定客户）', total: r2(retail.total), received: r2(retail.total - retail.receivable), receivable: r2(retail.receivable), advance: 0, credit_limit: null, over_limit: false, unlinked: true });
   }
   const purchaseTotal = r2(sum(sup, 'total')), purchasePaid = r2(sum(sup, 'paid')), purchaseOutstanding = r2(sum(sup, 'payable'));
   const saleTotal = r2(sum(cus, 'total')), saleReceived = r2(sum(cus, 'received')), saleOutstanding = r2(sum(cus, 'receivable'));
+  const totalAdvancePay = r2(sum(sup, 'advance')), totalAdvanceReceive = r2(sum(cus, 'advance'));
   return {
     totalPayable: purchaseOutstanding,
     totalReceivable: saleOutstanding,
-    purchase: { total: purchaseTotal, paid: purchasePaid, outstanding: purchaseOutstanding },
-    sale: { total: saleTotal, received: saleReceived, outstanding: saleOutstanding },
+    // 预付款 / 预收款余额（全量快照，与应收应付同口径）
+    totalAdvancePay,
+    totalAdvanceReceive,
+    purchase: { total: purchaseTotal, paid: purchasePaid, outstanding: purchaseOutstanding, advance: totalAdvancePay },
+    sale: { total: saleTotal, received: saleReceived, outstanding: saleOutstanding, advance: totalAdvanceReceive },
     suppliers: sup,
     customers: cus,
     net: r2(saleOutstanding - purchaseOutstanding),
@@ -4135,6 +4214,8 @@ app.get('/api/reports/export', requireAuth, (req, res) => {
         ['总应收（未收）', money(ar.totalReceivable), '全量：截至导出时刻的余额'],
         ['总应付（未付）', money(ar.totalPayable), '全量：截至导出时刻的余额'],
         ['净头寸（应收-应付）', money(ar.net), '全量：截至导出时刻的余额'],
+        ['预付款余额（已付未用）', money(ar.totalAdvancePay), '全量：已付给供应商但还没分摊到任何采购单'],
+        ['预收款余额（已收未用）', money(ar.totalAdvanceReceive), '全量：客户已付但还没分摊到任何销售单'],
         ['本期销售金额', salesTotal, PERIOD],
         ['本期销售利润（已实现）', salesProfit, PERIOD],
         ['本期采购金额', purchTotal, PERIOD],
@@ -4153,21 +4234,21 @@ app.get('/api/reports/export', requireAuth, (req, res) => {
       // 应收/应付是全量余额，不随上面的期间变化；sheet 名直接写清楚，避免被当成本期数
       name: '应收明细（按客户·全量）',
       rows: [
-        ['客户', '总销售', '已收', '应收未收', '授信额度', '状态'],
+        ['客户', '总销售', '已收', '应收未收', '预收款(未用)', '授信额度', '状态'],
         ...ar.customers.map(c => [
-          c.name, c.total, c.received, c.receivable,
+          c.name, c.total, c.received, c.receivable, r2(c.advance),
           c.credit_limit == null ? '—' : c.credit_limit,
           c.credit_limit == null ? '—' : (c.over_limit ? '超授信' : '正常')
         ]),
-        ['合计', ar.sale.total, ar.sale.received, ar.sale.outstanding, '', '']
+        ['合计', ar.sale.total, ar.sale.received, ar.sale.outstanding, r2(ar.totalAdvanceReceive), '', '']
       ]
     },
     {
       name: '应付明细（按供应商·全量）',
       rows: [
-        ['供应商', '总采购', '已付', '应付未付'],
-        ...ar.suppliers.map(s => [s.name, s.total, s.paid, s.payable]),
-        ['合计', ar.purchase.total, ar.purchase.paid, ar.purchase.outstanding]
+        ['供应商', '总采购', '已付', '应付未付', '预付款(未用)'],
+        ...ar.suppliers.map(s => [s.name, s.total, s.paid, s.payable, r2(s.advance)]),
+        ['合计', ar.purchase.total, ar.purchase.paid, ar.purchase.outstanding, r2(ar.totalAdvancePay)]
       ]
     },
     {

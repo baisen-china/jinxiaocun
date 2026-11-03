@@ -1667,13 +1667,21 @@
   function partnerView(kind) {
     return async () => {
       const act = $('#topbar-actions');
-      act.innerHTML = `<button class="btn-primary" id="add-p">+ 新增</button>`;
+      const apiPath = kind === 'suppliers' ? '/api/suppliers' : '/api/customers';
+      const isAdmin = !!(state.user && state.user.role === 'admin');
+      // 导出/打印只给管理员：这两个按钮输出的是完整往来单位台账（含授信额度、应收、预收），
+      // 属于经营数据，普通用户能看到列表但不应把整本台账带走。
+      act.innerHTML = `<button class="btn-primary" id="add-p">+ 新增</button>` + (isAdmin
+        ? `<button class="btn-ghost" id="p-print" title="按当前搜索结果打印（A4，可另存 PDF）">🖨️ 打印</button>
+           <button class="btn-ghost" id="p-export" title="按当前搜索结果导出 Excel">⬇️ 导出 Excel</button>`
+        : '');
       $('#content').innerHTML = `<div class="card"><div class="toolbar"><input id="p-search" placeholder="搜索名称 / 联系人 / 电话"></div>
         <div id="p-body" class="table-wrap"><p class="empty">加载中…</p></div></div>`;
       $('#add-p').onclick = () => openPartnerModal(kind);
-      const apiPath = kind === 'suppliers' ? '/api/suppliers' : '/api/customers';
+      let lastRows = [];   // 打印/导出都基于「当前搜索结果」，不是全量
       const load = debounce(async () => {
         const rows = await api('GET', `${apiPath}?search=${encodeURIComponent($('#p-search').value.trim())}`);
+        lastRows = rows;
         $('#p-body').innerHTML = partnerTable(rows, kind);
         $$('#p-body tr[data-id]').forEach((tr) => {
           const id = tr.dataset.id;
@@ -1688,19 +1696,97 @@
         });
       }, 200);
       $('#p-search').addEventListener('input', load);
+      if (isAdmin) {
+        $('#p-print').onclick = () => printPartners(kind, lastRows);
+        $('#p-export').onclick = (e) => exportPartners(e.currentTarget, kind, apiPath);
+      }
       load();
     };
   }
   const renderSuppliers = partnerView('suppliers');
   const renderCustomers = partnerView('customers');
 
+  // 打印往来单位台账：与屏幕上的行列一致，输出 A4 纵向、可另存 PDF
+  function printPartners(kind, rows) {
+    const isSup = kind === 'suppliers';
+    const label = isSup ? '供应商' : '客户';
+    if (!rows || !rows.length) return toast(`当前没有可打印的${label}`, true);
+    const brand = (state.branding && state.branding.shopName) || '';
+    const title = `${label}台账`;
+    const search = ($('#p-search') && $('#p-search').value.trim()) || '';
+    const head = isSup
+      ? ['名称', '联系人', '电话', '地址', '备注']
+      : ['名称', '联系人', '电话', '地址', '备注', '授信额度', '当前应收', '预收款', '可用额度'];
+    const body = rows.map(r => isSup
+      ? `<tr><td>${esc(r.name || '')}</td><td>${esc(r.contact || '-')}</td><td>${esc(r.phone || '-')}</td><td>${esc(r.address || '-')}</td><td>${esc(r.note || '-')}</td></tr>`
+      : `<tr><td>${esc(r.name || '')}</td><td>${esc(r.contact || '-')}</td><td>${esc(r.phone || '-')}</td><td>${esc(r.address || '-')}</td><td>${esc(r.note || '-')}</td>
+         <td class="num">${yuan(r.credit_limit)}</td><td class="num">${yuan(r.receivable)}</td>
+         <td class="num">${r.advance > 0.001 ? yuan(r.advance) : '—'}</td><td class="num">${yuan(r.available)}</td></tr>`).join('');
+    const tfoot = isSup ? '' : `<tfoot><tr><td colspan="6">合计</td>
+      <td class="num">${yuan(rows.reduce((s, r) => s + (Number(r.credit_limit) || 0), 0))}</td>
+      <td class="num">${yuan(rows.reduce((s, r) => s + (Number(r.receivable) || 0), 0))}</td>
+      <td class="num">${yuan(rows.reduce((s, r) => s + (Number(r.advance) || 0), 0))}</td>
+      <td class="num">${yuan(rows.reduce((s, r) => s + (Number(r.available) || 0), 0))}</td></tr></tfoot>`;
+
+    const html = `<!doctype html><html lang="zh-CN"><head><meta charset="utf-8">
+<title>${esc((brand ? brand + ' · ' : '') + title)}</title>
+<style>
+  @page { size: A4 portrait; margin: 14mm; }
+  * { box-sizing: border-box; }
+  body { font-family: "Microsoft YaHei","PingFang SC","Hiragino Sans GB",sans-serif; color:#111; font-size:12.5px; margin:0; padding:14px; }
+  h1 { font-size:18px; margin:0 0 8px; letter-spacing:.5px; text-align:center; }
+  .meta { color:#555; font-size:11.5px; line-height:1.9; margin-bottom:12px; text-align:center; }
+  table { width:100%; border-collapse:collapse; }
+  th, td { border:1px solid #b4b4b4; padding:6px 8px; text-align:left; }
+  th { background:#efefef; font-weight:600; white-space:nowrap; }
+  .num { text-align:right; white-space:nowrap; font-variant-numeric:tabular-nums; }
+  tfoot td { font-weight:700; background:#f7f7f7; }
+  .foot { margin-top:12px; color:#666; font-size:11px; }
+  .sign { margin-top:26px; display:flex; justify-content:space-between; color:#444; font-size:12px; }
+  @media print { thead { display:table-header-group; } tr { page-break-inside:avoid; } }
+</style></head><body>
+<h1>${esc((brand ? brand + ' · ' : '') + title)}</h1>
+<div class="meta">共 ${rows.length} 家${label}${search ? `　｜　搜索：${esc(search)}` : ''}<br>
+打印时间：${esc(new Date().toLocaleString('zh-CN', { hour12: false }))}</div>
+<table>
+  <thead><tr>${head.map(h => `<th${h.match(/额度|应收|预收/) ? ' class="num"' : ''}>${h}</th>`).join('')}</tr></thead>
+  <tbody>${body}</tbody>
+  ${tfoot}
+</table>
+<div class="foot">口径说明：当前应收 = 该${label}所有未退单的销售单金额 − 已分摊收款；预收款 = 已收但尚未分摊到任何单据的余额，先冲抵应收后才占用授信额度；可用额度 = 授信额度 − max(0, 应收 − 预收款)。</div>
+<div class="sign"><span>制表：____________</span><span>复核：____________</span></div>
+</body></html>`;
+    openPrintWindow(html);
+  }
+
+  // 导出往来单位清单：服务端用与页面同一份查询（含搜索条件），保证导出的就是屏幕上这批
+  async function exportPartners(btn, kind, apiPath) {
+    const label = kind === 'suppliers' ? '供应商' : '客户';
+    const s = ($('#p-search') && $('#p-search').value.trim()) || '';
+    if (btn) btn.disabled = true;
+    try {
+      const res = await fetch(`${apiPath}/export?search=${encodeURIComponent(s)}`, { credentials: 'same-origin' });
+      if (!res.ok) {
+        let msg = '导出失败';
+        try { const d = await res.json(); msg = d.error || msg; } catch (e) { /* 忽略 */ }
+        throw new Error(msg);
+      }
+      downloadBlob(await res.blob(), `${label}清单_${fileStamp()}.xlsx`);
+      toast(`已导出${label}清单`);
+    } catch (e) { toast(e.message, true); }
+    if (btn) btn.disabled = false;
+  }
+
   function partnerTable(rows, kind) {
     if (!rows.length) return '<p class="empty">暂无数据</p>';
-    const creditHead = kind === 'customer'
+    // 注意：这里传进来的是路由名，客户是复数 customers（不是 customer）。
+    // 早先写成 kind === 'customer'，条件永远不成立，导致客户页的授信/应收/预收款/可用额度四列一直没渲染出来。
+    const isCustomer = kind === 'customers';
+    const creditHead = isCustomer
       ? `<th class="num">授信额度</th><th class="num">当前应收</th><th class="num">预收款</th><th class="num">可用额度</th>`
       : '';
     // 可用额度 = 授信额度 - max(0, 应收 - 预收款)：预收款是客户已经交过的钱，先冲抵欠款，剩下的才占额度
-    const creditBody = (r) => kind === 'customer'
+    const creditBody = (r) => isCustomer
       ? `<td class="num">${yuan(r.credit_limit)}</td><td class="num">${yuan(r.receivable)}</td>
          <td class="num">${r.advance > 0.001 ? `<span class="tag ok">${yuan(r.advance)}</span>` : '<span class="muted">—</span>'}</td>
          <td class="num ${r.available < -0.001 ? 'danger' : ''}" title="授信占用 ${yuan(r.credit_used)}">${yuan(r.available)}</td>`
@@ -2525,17 +2611,20 @@
   function repSummaryTable(rows, kind) {
     if (!rows.length) return '<p class="empty">暂无' + (kind === 'supplier' ? '有应付的供应商' : '有应收的客户') + '</p>';
     const head = kind === 'supplier'
-      ? `<th>供应商</th><th class="num">总采购</th><th class="num">已付</th><th class="num">应付未付</th><th></th>`
-      : `<th>客户</th><th class="num">总销售</th><th class="num">已收</th><th class="num">应收未收</th><th class="num">授信额度</th><th>状态</th><th></th>`;
+      ? `<th>供应商</th><th class="num">总采购</th><th class="num">已付</th><th class="num">应付未付</th><th class="num">预付款(未用)</th><th></th>`
+      : `<th>客户</th><th class="num">总销售</th><th class="num">已收</th><th class="num">应收未收</th><th class="num">预收款(未用)</th><th class="num">授信额度</th><th>状态</th><th></th>`;
     const body = rows.map(r => {
+      // 预付款/预收款是「钱已经过了手、但还没落到单据上」的余额，与应付/应收是两笔不同性质的钱，
+      // 单独一列摆出来，避免只看「应付未付」就以为还要再掏这么多现金。
+      const advCell = r.advance > 0.001 ? `<span class="tag ok">${yuan(r.advance)}</span>` : '<span class="muted">—</span>';
       if (kind === 'supplier') {
-        return `<tr data-id="${r.id}"${r.unlinked ? ' class="row-unlinked"' : ''}><td>${esc(r.name)}</td><td class="num">${yuan(r.total)}</td><td class="num">${yuan(r.paid)}</td><td class="num"><b>${yuan(r.payable)}</b></td><td class="ops"><button class="btn-ghost small" data-detail="${r.id}">查看明细</button></td></tr>`;
+        return `<tr data-id="${r.id}"${r.unlinked ? ' class="row-unlinked"' : ''}><td>${esc(r.name)}</td><td class="num">${yuan(r.total)}</td><td class="num">${yuan(r.paid)}</td><td class="num"><b>${yuan(r.payable)}</b></td><td class="num">${advCell}</td><td class="ops"><button class="btn-ghost small" data-detail="${r.id}">查看明细</button></td></tr>`;
       }
       const over = r.over_limit ? `<span class="tag danger">超授信</span>` : `<span class="tag good">正常</span>`;
       // 散客（未指定客户）无授信额度概念，相关列显示「—」
       const creditCell = (r.credit_limit == null) ? '<span class="muted">—</span>' : yuan(r.credit_limit);
       const statusCell = (r.credit_limit == null) ? '<span class="muted">—</span>' : over;
-      return `<tr data-id="${r.id}"${r.unlinked ? ' class="row-unlinked"' : ''}><td>${esc(r.name)}</td><td class="num">${yuan(r.total)}</td><td class="num">${yuan(r.received)}</td><td class="num ${r.over_limit ? 'danger' : ''}"><b>${yuan(r.receivable)}</b></td><td class="num">${creditCell}</td><td>${statusCell}</td><td class="ops"><button class="btn-ghost small" data-detail="${r.id}">查看明细</button></td></tr>`;
+      return `<tr data-id="${r.id}"${r.unlinked ? ' class="row-unlinked"' : ''}><td>${esc(r.name)}</td><td class="num">${yuan(r.total)}</td><td class="num">${yuan(r.received)}</td><td class="num ${r.over_limit ? 'danger' : ''}"><b>${yuan(r.receivable)}</b></td><td class="num">${advCell}</td><td class="num">${creditCell}</td><td>${statusCell}</td><td class="ops"><button class="btn-ghost small" data-detail="${r.id}">查看明细</button></td></tr>`;
     }).join('');
     return `<div class="table-wrap"><table><thead><tr>${head}</tr></thead><tbody>${body}</tbody></table></div>`;
   }
@@ -2879,11 +2968,13 @@
     ]);
     content.innerHTML = `
       <div class="stat-section">
-        <div class="stat-section-title">资金往来<span class="ss-sub">此刻还欠多少、别人还欠你多少</span></div>
+        <div class="stat-section-title">资金往来<span class="ss-sub">此刻还欠多少、别人还欠你多少、预收预付各压了多少</span></div>
         <div class="grid cols-3">
           <div class="stat good clickable" id="card-receivable"><div class="label">总应收（未收）</div><div class="value">${yuan(ar.totalReceivable)}</div><div class="sub">点此查看按客户明细 →</div></div>
           <div class="stat warn clickable" id="card-payable"><div class="label">总应付（未付）</div><div class="value">${yuan(ar.totalPayable)}</div><div class="sub">点此查看按供应商明细 →</div></div>
-          <div class="stat"><div class="label">净头寸（应收-应付）</div><div class="value">${yuan(ar.net)}</div><div class="sub">正数=资金净流入</div></div>
+          <div class="stat"><div class="label">净头寸（应收-应付）</div><div class="value">${yuan(ar.net)}</div><div class="sub">正数=资金净流入（不含预收/预付）</div></div>
+          <div class="stat clickable" id="card-adv-receive"><div class="label">预收款余额（已收未用）</div><div class="value">${yuan(ar.totalAdvanceReceive)}</div><div class="sub">客户已付、尚未抵扣任何单据 · 点此看是哪几家 →</div></div>
+          <div class="stat clickable" id="card-adv-pay"><div class="label">预付款余额（已付未用）</div><div class="value">${yuan(ar.totalAdvancePay)}</div><div class="sub">已付供应商、尚未分摊到采购单 · 点此看是哪几家 →</div></div>
         </div>
       </div>
 
@@ -2946,6 +3037,9 @@
 
     $('#card-receivable').onclick = () => gotoReport({ kind: 'receivable' });
     $('#card-payable').onclick = () => gotoReport({ kind: 'payable' });
+    // 预收款看客户表、预付款看供应商表——两张表里都新加了同名一列，点进去能直接看到是哪几家压着钱
+    $('#card-adv-receive').onclick = () => gotoReport({ kind: 'receivable' });
+    $('#card-adv-pay').onclick = () => gotoReport({ kind: 'payable' });
     $('#card-returns').onclick = () => gotoReport({ kind: 'returns' });
     $('#card-price').onclick = () => gotoReport({ kind: 'price' });
     // 库存分类表的打印/导出：数据用页面这一份（库存是此刻快照，与上方日期段无关）
