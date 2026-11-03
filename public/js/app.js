@@ -512,9 +512,10 @@
   // ---------- 侧栏背景音乐播放器 ----------
   // 音乐目录固定为服务端 mp3/（不可配置）；用户把 .mp3 拷进该目录即可播放。
   const music = { box: null, audio: null, files: [], idx: 0, ready: false, loading: false };
-  // 插播广播：与音乐播放状态无关，按间隔周期播 Broadcast/guangbo.mp3。
+  // 插播广播：与音乐播放状态无关，按间隔周期轮流播 Broadcast/guangbo-*.mp3。
   // 用「按墙钟累加经过时间」而非一次性长定时器：暂停/改间隔都不需要重排计时，天然不会漂移。
-  const bc = { audio: null, info: null, timer: null, elapsed: 0, lastAt: 0, playing: false, resumeMusic: false, blocked: false, fetchedAt: 0 };
+  // files/idx 是「按顺序轮播」的游标：每次插播只播一条，下一次到点播下一条，播完一轮从头来。
+  const bc = { audio: null, info: null, files: [], idx: 0, playingName: '', timer: null, elapsed: 0, lastAt: 0, playing: false, resumeMusic: false, blocked: false, fetchedAt: 0 };
 
   // 广播开关与间隔实时读配置，配置页保存后立刻生效（无需重建播放器）
   function bcOn() {
@@ -699,8 +700,9 @@
 
   // ---------- 插播广播 ----------
   // 广播开关**独立生效**：不论背景音乐是否在播（甚至音乐开关是关闭的），
-  // 每累计满 interval 秒就播一次 Broadcast/guangbo.mp3；若此刻音乐正在播，先暂停它，广播结束再续播。
-  // 广播文件缺失则静默跳过，不打断任何东西。
+  // 每累计满 interval 秒就播一条 Broadcast/guangbo-*.mp3；若此刻音乐正在播，先暂停它，广播结束再续播。
+  // 多条广播按文件名第二个数字的顺序轮流播（guangbo-1-1、guangbo-2-2、guangbo-3-3、guangbo-3-4…），
+  // 每次只播一条，下一次到点播下一条，一轮播完从头再来；目录为空则静默跳过，不打断任何东西。
   function startBroadcastTimer() {
     if (bc.timer) return;
     bc.elapsed = 0;
@@ -726,7 +728,7 @@
       bc.elapsed += delta;
       if (bc.elapsed >= bcInterval()) { fireBroadcast(); return; }
     }
-    // 每 60 秒顺带刷新一次广播文件信息：新增/替换 guangbo.mp3 后即使音乐没开也能自动生效
+    // 每 60 秒顺带刷新一次广播文件信息：往目录里新增/替换 guangbo-*.mp3 后即使音乐没开也能自动生效
     if (now - (bc.fetchedAt || 0) > 60000) loadBroadcastInfo();
     updateBcStatus();
   }
@@ -735,13 +737,18 @@
     bc.elapsed = 0;
     bc.lastAt = Date.now();
     bc.blocked = false;
-    const info = bc.info;
-    if (!info || !info.exists || !info.url || !bc.audio) { updateBcStatus(); return; }   // 没文件：跳过本次
+    if (!bc.files.length || !bc.audio) { updateBcStatus(); return; }   // 没文件：跳过本次
+    const f = bc.files[bc.idx % bc.files.length];
+    // 先把游标推到下一条：即使这一条文件损坏、或浏览器拒绝播放，下次也换一句，
+    // 不会永远卡在同一句上（真卡住时表现就是「广播再也不响」，很难排查）。
+    bc.idx = (bc.idx + 1) % bc.files.length;
+    try { localStorage.setItem('bcNext', bc.files[bc.idx].name); } catch (e) { /* 隐私模式禁写，忽略 */ }
     bc.playing = true;
+    bc.playingName = f.name;
     // 只有音乐此刻真的在播，广播结束后才需要续播；音乐没开就只是播完广播
     bc.resumeMusic = musicOn() && !!music.audio && !music.audio.paused;
     bc.audio.volume = music.audio ? music.audio.volume : 0.7;
-    bc.audio.src = info.url;
+    bc.audio.src = f.url;
     try { bc.audio.currentTime = 0; } catch (e) { /* 尚未就绪，忽略 */ }
     if (music.audio && !music.audio.paused) music.audio.pause();
     updateBcStatus();
@@ -757,6 +764,7 @@
     if (!bc.playing || !bc.audio) return;
     const resume = bc.resumeMusic;
     bc.playing = false;
+    bc.playingName = '';
     bc.resumeMusic = false;
     bc.elapsed = 0;
     bc.lastAt = Date.now();
@@ -770,6 +778,7 @@
   function stopBroadcast() {
     if (!bc.playing || !bc.audio) return;
     bc.playing = false;
+    bc.playingName = '';
     bc.resumeMusic = false;
     bc.elapsed = 0;
     try { bc.audio.pause(); } catch (e) { /* 忽略 */ }
@@ -784,7 +793,21 @@
     bc.fetchedAt = Date.now();
     try { bc.info = await api('GET', '/api/broadcast/info'); }
     catch (e) { bc.info = null; }
+    bcSyncFiles();
     updateBcStatus();
+  }
+
+  // 同步广播文件列表与播放游标。文件增删后按「下一条的文件名」重新定位，
+  // 而不是把游标清零——否则每 60 秒一次的自动刷新都会让下一句跳回第一条，轮播就永远卡在开头。
+  function bcSyncFiles() {
+    const files = (bc.info && bc.info.files) || [];
+    bc.files = files;
+    if (!files.length) { bc.idx = 0; return; }
+    let name = '';
+    try { name = localStorage.getItem('bcNext') || ''; } catch (e) { /* 隐私模式禁读，忽略 */ }
+    let i = name ? files.findIndex(f => f.name === name) : -1;
+    if (i < 0) i = Math.min(bc.idx, files.length - 1);
+    bc.idx = i;
   }
 
   function updateBcStatus() {
@@ -793,23 +816,32 @@
     if (!bcOn()) { el.hidden = true; el.textContent = ''; return; }
     el.hidden = false;
     const iv = bcInterval();
-    if (bc.playing) { el.textContent = '📢 正在插播广播…'; el.title = 'Broadcast/guangbo.mp3'; return; }
+    const files = bc.files;
+    const total = files.length;
+    if (bc.playing) {
+      const n = files.findIndex(f => f.name === bc.playingName);
+      // 侧栏这块很窄（约 130px），文案必须短：长句会被截断成「还有 2…」，反而看不清
+      el.textContent = total > 1 ? `📢 插播中 ${n >= 0 ? n + 1 : '—'}/${total}` : '📢 插播中…';
+      el.title = `正在播放 Broadcast/${bc.playingName}（共 ${total} 条，按顺序轮流播）`;
+      return;
+    }
     const info = bc.info;
-    if (!info) { el.textContent = '📢 插播广播：状态读取中…'; return; }
-    if (!info.exists) {
-      el.textContent = '📢 未找到 Broadcast/guangbo.mp3，插播已跳过';
-      el.title = '请把 guangbo.mp3 放到系统 Broadcast 目录';
+    if (!info) { el.textContent = '📢 广播：读取中…'; return; }
+    if (!total) {
+      el.textContent = '📢 未找到广播文件';
+      el.title = '请把 guangbo-1-1.mp3 这类文件放进系统 Broadcast 目录';
       return;
     }
     if (bc.blocked) {
-      el.textContent = '📢 浏览器阻止了自动播放，点一下页面任意处即可继续插播';
+      el.textContent = '📢 点一下页面继续';
       el.title = '浏览器要求先有用户操作才允许播放声音';
       return;
     }
     // 倒计时向上取整：只显示整数秒，且不会出现「还有 0 秒」却仍在等待的情况
     const left = Math.max(0, Math.ceil(iv - bc.elapsed));
-    el.textContent = `📢 广播每 ${iv} 秒插播一次（还有 ${left} 秒）`;
-    el.title = 'Broadcast/guangbo.mp3';
+    const next = files[bc.idx % total];
+    el.textContent = `📢 下一句 ${bc.idx + 1}/${total} · ${left} 秒`;
+    el.title = `每 ${iv} 秒插播一条；下一句 Broadcast/${next ? next.name : '—'}（共 ${total} 条按顺序轮流播）`;
   }
 
   // ---------- 系统配置（管理员） ----------
@@ -894,11 +926,12 @@
       </div>
       <div class="card" style="margin-top:16px">
         <div class="card-title">插播广播</div>
-        <p class="settings-desc">开启后，每到一个间隔周期就插播一次广播：若此刻背景音乐正在播放，会先暂停音乐、广播播完自动接着放；音乐没在播（甚至音乐开关关闭）也照常按周期插播。广播文件目录固定为系统根目录下的 <code>Broadcast</code> 文件夹，文件名固定为 <code>guangbo.mp3</code>（均不可更改）：把文件拷进去即可生效，替换后无需重启（最长约 1 分钟自动生效）。</p>
+        <p class="settings-desc">开启后，每到一个间隔周期就插播一条广播：若此刻背景音乐正在播放，会先暂停音乐、广播播完自动接着放；音乐没在播（甚至音乐开关关闭）也照常按周期插播。广播文件放在系统根目录下的 <code>Broadcast</code> 文件夹，<b>条数不限</b>，文件名格式为 <code>guangbo-词序号-本轮位置.mp3</code>，两个数字都是 1~9：第一个数字表示这是第几条广播词，第二个数字表示这一句在本轮插播里排第几个，播放顺序只看第二个数字。<br>
+        例如一共有 3 句广播词、一轮排 4 条、第 3 句要播两次，就放 <code>guangbo-1-1.mp3</code>、<code>guangbo-2-2.mp3</code>、<code>guangbo-3-3.mp3</code>、<code>guangbo-3-4.mp3</code>。每次只播一条，下一次到点播下一条，一轮播完从头再来；拷进目录即生效，无需重启（最长约 1 分钟自动识别）。</p>
         <div class="chk-list">
           <label class="chk-row">
             <input type="checkbox" id="set-bc" ${bcfg.enabled ? 'checked' : ''}>
-            <span><b>启用插播广播</b><em>不论音乐是否在播放，每隔一个周期插播 Broadcast/guangbo.mp3；音乐在播时播完自动续播</em></span>
+            <span><b>启用插播广播</b><em>不论音乐是否在播放，每隔一个周期插播一条 Broadcast/guangbo-*.mp3，按文件名顺序轮播；音乐在播时播完自动续播</em></span>
           </label>
         </div>
         <div class="form-row" style="margin-top:14px">
@@ -954,15 +987,19 @@
         <button class="btn-primary" id="save-settings">保存配置</button>
       </div>
       <p class="settings-desc" style="margin-top:12px">提示：销售额统计口径为「销售出库单金额合计」，与报表一致；退单待审的单据仍计入，已确认退单的不计入。品牌、动画与权限设置保存后立即生效；开机动画的停留时长在下次打开或刷新页面时按新设置播放。</p>`;
-    // 广播文件检测：让管理员一眼看到 guangbo.mp3 是否就位
+    // 广播文件检测：让管理员一眼看到有哪些 guangbo-*.mp3、将按什么顺序轮播
     (async () => {
       const hint = $('#bc-file-hint');
       if (!hint) return;
       try {
         const bi = await api('GET', '/api/broadcast/info');
-        hint.textContent = bi.exists
-          ? `✅ 已找到 Broadcast/guangbo.mp3（${(bi.size / 1048576).toFixed(2)} MB）`
-          : '⚠️ 未找到 Broadcast/guangbo.mp3，插播将自动跳过';
+        const list = bi.files || [];
+        if (!list.length) {
+          hint.textContent = '⚠️ 未找到 Broadcast/guangbo-*.mp3，插播将自动跳过';
+        } else {
+          const names = list.slice(0, 8).map(f => `<code>${esc(f.name)}</code>`).join(' → ');
+          hint.innerHTML = `✅ 已识别 ${list.length} 条，轮播顺序：${names}${list.length > 8 ? ` …（共 ${list.length} 条）` : ''}`;
+        }
       } catch (e) { hint.textContent = '广播文件状态读取失败'; }
     })();
     $('#bd-preview').onclick = () => {
@@ -2866,7 +2903,15 @@
           ${inventoryStatCards(ar.stockValue)}
         </div>
       </div>
-      <div class="card" style="margin-top:16px"><div class="card-title">库存商品金额 · 按分类</div>${inventoryCategoryTable(ar.stockValue && ar.stockValue.byCategory)}</div>
+      <div class="card" style="margin-top:16px">
+        <div class="card-title"><span>库存商品金额 · 按分类</span>
+          <span class="alert-tools">
+            <button class="btn-ghost small" id="sv-print" title="打印这张分类表（A4 纵向，可另存为 PDF）">打印</button>
+            <button class="btn-ghost small" id="sv-export" title="导出为 Excel">导出 Excel</button>
+          </span>
+        </div>
+        ${inventoryCategoryTable(ar.stockValue && ar.stockValue.byCategory)}
+      </div>
       <div class="card" style="margin-top:16px">
         <div class="card-title">专项报表 <span class="muted" style="font-weight:400;font-size:12px">（${esc(pe.period)}，点卡片查看明细）</span></div>
         <div class="grid cols-2">
@@ -2886,13 +2931,30 @@
           </div>
         </div>
       </div>
-      <div class="card" style="margin-top:16px"><div class="card-title">本期采购明细（${pe.period}）</div>${docDetailTable(pe.purchases, 'supplier')}</div>
-      <div class="card" style="margin-top:16px"><div class="card-title">本期销售明细（${pe.period}）</div>${docDetailTable(pe.sales, 'customer')}</div>`;
+      <div class="card" style="margin-top:16px">
+        <div class="card-title"><span>本期采购明细（${esc(pe.period)}）</span>
+          <span class="alert-tools"><button class="btn-ghost small" id="pe-export-purchase" title="按当前日期段导出 Excel">导出 Excel</button></span>
+        </div>
+        ${docDetailTable(pe.purchases, 'supplier')}
+      </div>
+      <div class="card" style="margin-top:16px">
+        <div class="card-title"><span>本期销售明细（${esc(pe.period)}）</span>
+          <span class="alert-tools"><button class="btn-ghost small" id="pe-export-sale" title="按当前日期段导出 Excel">导出 Excel</button></span>
+        </div>
+        ${docDetailTable(pe.sales, 'customer')}
+      </div>`;
 
     $('#card-receivable').onclick = () => gotoReport({ kind: 'receivable' });
     $('#card-payable').onclick = () => gotoReport({ kind: 'payable' });
     $('#card-returns').onclick = () => gotoReport({ kind: 'returns' });
     $('#card-price').onclick = () => gotoReport({ kind: 'price' });
+    // 库存分类表的打印/导出：数据用页面这一份（库存是此刻快照，与上方日期段无关）
+    state.cache.__stockValue = ar.stockValue;
+    $('#sv-print').onclick = () => printStockCategory(state.cache.__stockValue);
+    $('#sv-export').onclick = () => exportStockCategory($('#sv-export'));
+    // 本期采购/销售明细：导出按当前日期段，和屏幕上的两张表同一批单据
+    $('#pe-export-purchase').onclick = () => exportPeriodDetail('purchase', $('#pe-export-purchase'));
+    $('#pe-export-sale').onclick = () => exportPeriodDetail('sale', $('#pe-export-sale'));
     bindPeriod();
 
     function bindPeriod() {
@@ -2915,6 +2977,87 @@
       const exl = $('#rep-export-ledger');
       if (exl) exl.onclick = () => exportPartyLedger(exl);
     }
+  }
+
+  // 库存商品金额（按分类）：打印 & 导出
+  // 打印走独立窗口生成自包含 HTML（A4 纵向），与报表页共用同一份 byCategory 数据，
+  // 不重新请求接口——否则打印时库存可能已被别的单据改过，印出来的和屏幕上的对不上。
+  function printStockCategory(sv) {
+    if (!sv || !(sv.byCategory || []).length) return toast('暂无库存商品，没有可打印的内容', true);
+    const rows = sv.byCategory;
+    const brand = (state.branding && state.branding.shopName) || '';
+    const cost = Number(sv.costValue) || 0;
+    const pct = (v) => (cost > 0 ? ((Number(v) || 0) / cost * 100).toFixed(1) + '%' : '—');
+    const body = rows.map(r => `<tr>
+      <td>${esc(r.category || '未分类')}</td>
+      <td class="num">${intf(r.qty)}</td>
+      <td class="num">${yuan(r.costValue)}</td>
+      <td class="num">${yuan(r.retailValue)}</td>
+      <td class="num">${pct(r.costValue)}</td>
+    </tr>`).join('');
+
+    const html = `<!doctype html><html lang="zh-CN"><head><meta charset="utf-8">
+<title>${esc((brand ? brand + ' · ' : '') + '库存商品金额（按分类）')}</title>
+<style>
+  @page { size: A4 portrait; margin: 14mm; }
+  * { box-sizing: border-box; }
+  body { font-family: "Microsoft YaHei","PingFang SC","Hiragino Sans GB",sans-serif; color:#111; font-size:12.5px; margin:0; padding:14px; }
+  h1 { font-size:18px; margin:0 0 8px; letter-spacing:.5px; text-align:center; }
+  .meta { color:#555; font-size:11.5px; line-height:1.9; margin-bottom:12px; text-align:center; }
+  table { width:100%; border-collapse:collapse; }
+  th, td { border:1px solid #b4b4b4; padding:6px 8px; text-align:left; }
+  th { background:#efefef; font-weight:600; white-space:nowrap; }
+  .num { text-align:right; white-space:nowrap; font-variant-numeric:tabular-nums; }
+  tfoot td { font-weight:700; background:#f7f7f7; }
+  .foot { margin-top:12px; color:#666; font-size:11px; }
+  @media print { thead { display:table-header-group; } tr { page-break-inside:avoid; } }
+</style></head><body>
+<h1>${esc((brand ? brand + ' · ' : '') + '库存商品金额（按分类）')}</h1>
+<div class="meta">共 ${rows.length} 个分类 ｜ ${intf(sv.skuCount)} 种商品 ${intf(sv.qty)} 件<br>
+成本合计 ${yuan(sv.costValue)} ｜ 售价货值合计 ${yuan(sv.retailValue)} ｜ 潜在毛利 ${yuan(sv.grossMargin)}<br>
+打印时间：${esc(new Date().toLocaleString('zh-CN', { hour12: false }))}</div>
+<table>
+  <thead><tr><th>分类</th><th class="num">库存数量</th><th class="num">成本金额</th><th class="num">售价货值</th><th class="num">成本占比</th></tr></thead>
+  <tbody>${body}</tbody>
+  <tfoot><tr><td>合计</td><td class="num">${intf(sv.qty)}</td><td class="num">${yuan(sv.costValue)}</td><td class="num">${yuan(sv.retailValue)}</td><td class="num">100.0%</td></tr></tfoot>
+</table>
+<div class="foot">口径说明：数量按商品库存件数合计；成本金额 = 库存 × 进货价；售价货值 = 库存 × 销售价；潜在毛利 = 售价货值 − 成本金额。</div>
+</body></html>`;
+
+    openPrintWindow(html);
+  }
+
+  async function exportStockCategory(btn) {
+    if (btn) btn.disabled = true;
+    try {
+      const res = await fetch('/api/reports/stock-value/export', { credentials: 'same-origin' });
+      if (!res.ok) {
+        let msg = '导出失败';
+        try { const d = await res.json(); msg = d.error || msg; } catch (e) { /* 忽略 */ }
+        throw new Error(msg);
+      }
+      downloadBlob(await res.blob(), `库存商品分类表_${fileStamp()}.xlsx`);
+      toast('已导出库存商品分类表');
+    } catch (e) { toast(e.message, true); }
+    if (btn) btn.disabled = false;
+  }
+
+  // 本期采购 / 销售明细导出：日期段直接用页面当前的 reportFrom / reportTo
+  async function exportPeriodDetail(kind, btn) {
+    const isSale = kind !== 'purchase';
+    if (btn) btn.disabled = true;
+    try {
+      const qs = `?kind=${isSale ? 'sale' : 'purchase'}&from=${encodeURIComponent(reportFrom)}&to=${encodeURIComponent(reportTo)}`;
+      const res = await fetch('/api/reports/period/export' + qs, { credentials: 'same-origin' });
+      if (!res.ok) {
+        let msg = '导出失败';
+        try { const d = await res.json(); msg = d.error || msg; } catch (e) { /* 忽略 */ }
+        throw new Error(msg);
+      }
+      downloadBlob(await res.blob(), `${isSale ? '本期销售明细' : '本期采购明细'}_${reportFrom}_${reportTo}.xlsx`);
+      toast(`已导出${isSale ? '本期销售明细' : '本期采购明细'}`);
+    } catch (e) { toast(e.message, true); }
+    if (btn) btn.disabled = false;
   }
 
   // 导出当前日期段的 Excel 报表（多工作表：概览/应收/应付/采购/销售/库存/收付款）

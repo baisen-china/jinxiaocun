@@ -395,7 +395,7 @@ function getSettings() {
     password: { mode: PWD_MODES.includes(pd.mode) ? pd.mode : 'simple' },
     // 侧栏背景音乐开关：默认关闭（未设置视为关闭，与其它「未设置视为开启」的开关相反）
     music: { enabled: ms.enabled === true },
-    // 插播广播：音乐播放过程中每达到 interval 秒就暂停音乐插播一次 Broadcast/guangbo.mp3
+    // 插播广播：每达到 interval 秒就暂停音乐插播一条 Broadcast/guangbo-*.mp3
     // 开关默认关闭；间隔默认 120 秒，允许 30 ~ 3600 秒
     broadcast: {
       enabled: bcd.enabled === true,
@@ -545,40 +545,77 @@ app.get('/mp3/:file', requireAuth, (req, res) => {
   });
 });
 
-// ---------- 插播广播（目录固定为项目根目录下 Broadcast/，文件名固定 guangbo.mp3） ----------
-// 与音乐一样不可配置：用户把 guangbo.mp3 拷进该目录即可。文件名写死，接口不接收任何文件名参数，
-// 从根上排除路径穿越；文件不存在时前端静默跳过，不打断音乐。
+// ---------- 插播广播（目录固定为项目根目录下 Broadcast/） ----------
+// 文件名规则：guangbo-<广播词序号>-<本轮第几条>.mp3，两个数字都可以是 1~9（写更大也行，按数值排）。
+//   第一个数字 = 这是第几条广播词（内容编号，仅用于标识这是哪一句）；
+//   第二个数字 = 这句在「一轮插播」里排第几个，播放顺序只看它。
+//   例：一共有 3 句广播词、一轮排 4 条，第 3 句要播两次，就放：
+//       guangbo-1-1.mp3、guangbo-2-2.mp3、guangbo-3-3.mp3、guangbo-3-4.mp3
+//   每次插播只播一条，下一轮到点播下一条，播完一轮从头再来。
+// 兼容旧版单文件 guangbo.mp3（当作 1-1），已部署的机器不用改文件名也能继续用。
+// 接口不接收任意路径：音频请求只接受「目录扫描白名单里的文件名」，从根上排除路径穿越。
 const BROADCAST_DIR = path.join(__dirname, 'Broadcast');
-const BROADCAST_FILE = 'guangbo.mp3';
-const BROADCAST_PATH = path.join(BROADCAST_DIR, BROADCAST_FILE);
+const BROADCAST_RE = /^guangbo(?:-(\d+)-(\d+))?\.mp3$/i;
 try { fs.mkdirSync(BROADCAST_DIR, { recursive: true }); } catch (e) { /* 创建失败不阻断启动，前端会提示缺少文件 */ }
+
+// 扫描目录并按「第二个数字（轮次位置）→ 第一个数字（词序号）→ 文件名」排序
+function broadcastFiles() {
+  let names = [];
+  try { names = fs.readdirSync(BROADCAST_DIR); } catch (e) { return []; }
+  const out = [];
+  const legacy = [];
+  for (const name of names) {
+    const m = BROADCAST_RE.exec(name);
+    if (!m) continue;
+    const isLegacy = !m[1];
+    const order = m[1] ? parseInt(m[1], 10) : 1;
+    const seq = m[2] ? parseInt(m[2], 10) : 1;
+    let size = 0, mtime = 0;
+    try {
+      const st = fs.statSync(path.join(BROADCAST_DIR, name));
+      if (!st.isFile()) continue;
+      size = st.size; mtime = Math.floor(st.mtimeMs);
+    } catch (e) { continue; }
+    const row = { name, order, seq, size, mtime };
+    if (isLegacy) legacy.push(row); else out.push(row);
+  }
+  // 旧的裸 guangbo.mp3 只在「目录里还没有任何 guangbo-N-N.mp3」时才顶上，
+  // 否则它会和 guangbo-1-1.mp3 撞成同一条（order/seq 都是 1），一轮里被播两遍。
+  const list = out.length ? out : legacy;
+  list.sort((a, b) => (a.seq - b.seq) || (a.order - b.order) || a.name.localeCompare(b.name));
+  return list.map(f => ({
+    ...f,
+    // 版本号带上大小 + 修改时间：替换同名文件后浏览器不会命中旧音频缓存
+    url: `/api/broadcast/audio?f=${encodeURIComponent(f.name)}&v=${f.size}-${f.mtime}`
+  }));
+}
 
 function broadcastInfo() {
   const s = getSettings().broadcast;
-  let size = 0, mtime = 0, exists = false;
-  try {
-    const st = fs.statSync(BROADCAST_PATH);
-    exists = st.isFile();
-    size = st.size;
-    mtime = Math.floor(st.mtimeMs);
-  } catch (e) { exists = false; }
+  const files = broadcastFiles();
   return {
     enabled: s.enabled,
     interval: s.interval,
-    file: BROADCAST_FILE,
     dir: 'Broadcast',
-    exists,
-    size,
-    // 版本号取「大小 + 修改时间」：替换文件后浏览器不会命中旧音频缓存
-    url: exists ? `/api/broadcast/audio?v=${size}-${mtime}` : null
+    pattern: 'guangbo-词序号-本轮位置.mp3',
+    files,
+    count: files.length,
+    // 旧字段保留：单文件时代前端读的是 exists / url / file，这里指向第一条
+    exists: files.length > 0,
+    file: files.length ? files[0].name : '',
+    size: files.length ? files[0].size : 0,
+    url: files.length ? files[0].url : null
   };
 }
 
 app.get('/api/broadcast/info', requireAuth, (req, res) => res.json(broadcastInfo()));
 
-// 播放广播音频：路径写死，不接收参数
+// 播放广播音频：只认扫描白名单里的文件名，不在名单里一律 404
 app.get('/api/broadcast/audio', requireAuth, (req, res) => {
-  res.sendFile(BROADCAST_PATH, (err) => {
+  const want = String(req.query.f || '').trim();
+  const hit = want ? broadcastFiles().find(f => f.name === want) : null;
+  if (!hit) return res.status(404).end();
+  res.sendFile(path.join(BROADCAST_DIR, hit.name), (err) => {
     if (err && !res.headersSent) res.status(404).end();
   });
 });
@@ -3655,11 +3692,14 @@ app.get('/api/reports/party/:type/:id/ledger/export', requireAuth, (req, res) =>
 });
 
 // 本期经营数据（默认当月；支持 from/to=YYYY-MM-DD 日期段，或旧参数 period=YYYY-MM 整月）
-app.get('/api/reports/period', requireAuth, (req, res) => {
+// 抽成函数是为了让页面渲染与「导出本月采购/销售明细」共用同一份取数与日期解析，
+// 否则导出很容易自己在那边再写一遍 WHERE，出现「页面是 1~今天、导出是整月」这种对不上的情况。
+function periodData(query) {
+  const q = query || {};
   const nowMonth = db.prepare(`SELECT strftime('%Y-%m','now','localtime') AS p`).get().p;
-  let from = String(req.query.from || '').trim();
-  let to = String(req.query.to || '').trim();
-  const period = String(req.query.period || '').trim();
+  let from = String(q.from || '').trim();
+  let to = String(q.to || '').trim();
+  const period = String(q.period || '').trim();
   // 兼容旧参数：period=YYYY-MM → 该月首末日
   if (!from && !to && period) {
     from = period + '-01';
@@ -3682,14 +3722,109 @@ app.get('/api/reports/period', requireAuth, (req, res) => {
       (SELECT COALESCE(SUM(amount),0) FROM payment_allocations WHERE doc_type='purchase' AND doc_id=p.id) AS paid
     FROM purchases p LEFT JOIN suppliers s ON p.supplier_id=s.id WHERE p.created_at >= ? AND p.created_at < date(?, '+1 day') AND (p.status IS NULL OR p.status != 'returned') ORDER BY p.created_at DESC`).all(from, to);
   const salesAmount = r2(sales.amt), salesProfit = r2(sales.profit), purchaseAmount = r2(purchases.amt);
-  res.json({
+  return {
     period: label, label, from, to,
     salesAmount, salesProfit, purchaseAmount,
     saleCount: salesList.length, purchaseCount: purchList.length,
     estimatedProfit: r2(salesAmount - purchaseAmount),  // 预计利润：销售额 - 进货额（经营贡献估算）
     sales: salesList.map(r => ({ bill_no: r.bill_no, party: r.party || '散客', total: r2(r.total), profit: r2(r.profit || 0), deposit: r2(r.deposit || 0), received: r2(r.received), outstanding: r2(r.total - r.received), created_at: r.created_at })),
     purchases: purchList.map(r => ({ bill_no: r.bill_no, party: r.party || '直采', total: r2(r.total), deposit: r2(r.deposit || 0), paid: r2(r.paid), outstanding: r2(r.total - r.paid), created_at: r.created_at }))
-  });
+  };
+}
+
+app.get('/api/reports/period', requireAuth, (req, res) => {
+  res.json(periodData(req.query));
+});
+
+// ---------- 报表页面上的三张小表：导出 / 打印 ----------
+// 库存商品分类表导出：直接复用 inventoryValue()，与页面上「库存商品金额 · 按分类」同源
+app.get('/api/reports/stock-value/export', requireAuth, (req, res) => {
+  const sv = inventoryValue();
+  const rows = sv.byCategory || [];
+  if (!rows.length) return res.status(400).json({ error: '当前没有库存商品，无法导出' });
+  const brand = getSettings().branding;
+  const sheetRows = [
+    [`${brand.shopName || ''} · 库存商品金额（按分类）`],
+    [`导出时间：${nowLocal()}　｜　共 ${rows.length} 个分类　｜　${sv.skuCount} 种商品 ${sv.qty} 件`
+      + `　｜　成本合计 ${r2(sv.costValue)}　｜　售价货值合计 ${r2(sv.retailValue)}　｜　潜在毛利 ${r2(sv.grossMargin)}`],
+    [],
+    ['分类', '库存数量', '成本金额', '售价货值', '成本占比', '潜在毛利']
+  ];
+  for (const c of rows) {
+    const cost = r2(c.costValue);
+    sheetRows.push([
+      c.category || '未分类',
+      c.qty || 0,
+      cost,
+      r2(c.retailValue),
+      // 占比写成 "12.3%" 文本：写成 0.123 会被当成 0.123 元，写成 12.3 又会被当成 12.3 元
+      sv.costValue > 0 ? ((cost / sv.costValue) * 100).toFixed(1) + '%' : '—',
+      r2(r2(c.retailValue) - cost)
+    ]);
+  }
+  sheetRows.push([]);
+  sheetRows.push(['合计', sv.qty, r2(sv.costValue), r2(sv.retailValue), '100.0%', r2(sv.grossMargin)]);
+
+  let buf;
+  try { buf = buildWorkbook([{ name: '库存分类表', rows: sheetRows }]); }
+  catch (e) { return res.status(500).json({ error: '生成 Excel 失败：' + e.message }); }
+
+  const stamp = db.prepare("SELECT strftime('%Y%m%d','now','localtime') AS d").get().d;
+  const fname = `库存商品分类表_${stamp}.xlsx`;
+  res.setHeader('Content-Type', 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet');
+  res.setHeader('Content-Disposition', `attachment; filename="stock_category_${stamp}.xlsx"; filename*=UTF-8''${encodeURIComponent(fname)}`);
+  res.setHeader('Content-Length', buf.length);
+  res.end(buf);
+});
+
+// 本期采购明细 / 本期销售明细导出：与页面表格同列（单号、金额、已付/已收、未付/未收、利润、日期），
+// 额外补一列往来单位——页面上两张表按上下文看，导出成独立文件后没有单位就认不出是谁的单。
+app.get('/api/reports/period/export', requireAuth, (req, res) => {
+  const isSale = String(req.query.kind || 'sale') !== 'purchase';
+  const d = periodData(req.query);
+  const list = isSale ? d.sales : d.purchases;
+  if (!list.length) return res.status(400).json({ error: `本期没有${isSale ? '销售' : '采购'}单据，无法导出` });
+  const brand = getSettings().branding;
+  const who = isSale ? '客户' : '供应商';
+  const colSettled = isSale ? '已收' : '已付';
+  const colDue = isSale ? '未收' : '未付';
+
+  const headRow = isSale
+    ? ['销售单号', who, '交易时间', '金额', '定金(约定)', colSettled, colDue, '利润']
+    : ['采购单号', who, '交易时间', '金额', '定金(约定)', colSettled, colDue];
+
+  const rows = [
+    [`${brand.shopName || ''} · ${isSale ? '本期销售明细' : '本期采购明细'}（${d.period}）`],
+    [`导出时间：${nowLocal()}　｜　共 ${list.length} 单　｜　合计 ${r2(isSale ? d.salesAmount : d.purchaseAmount)}`
+      + (isSale ? `　｜　已实现利润 ${r2(d.salesProfit)}` : '')],
+    [],
+    headRow
+  ];
+  const sum = { total: 0, deposit: 0, settled: 0, due: 0, profit: 0 };
+  for (const r of list) {
+    const settled = isSale ? r.received : r.paid;
+    sum.total += r.total; sum.deposit += r.deposit; sum.settled += settled; sum.due += r.outstanding;
+    if (isSale) sum.profit += r.profit;
+    const line = [r.bill_no, r.party || (isSale ? '散客' : '直采'), (r.created_at || '').replace('T', ' ').slice(0, 19),
+      r.total, r.deposit > 0.001 ? r.deposit : '', settled, r.outstanding];
+    if (isSale) line.push(r.profit);
+    rows.push(line);
+  }
+  rows.push([]);
+  const totalLine = ['合计', `${list.length} 单`, '', r2(sum.total), sum.deposit > 0.001 ? r2(sum.deposit) : '', r2(sum.settled), r2(sum.due)];
+  if (isSale) totalLine.push(r2(sum.profit));
+  rows.push(totalLine);
+
+  let buf;
+  try { buf = buildWorkbook([{ name: isSale ? '本期销售明细' : '本期采购明细', rows }]); }
+  catch (e) { return res.status(500).json({ error: '生成 Excel 失败：' + e.message }); }
+
+  const stamp = db.prepare("SELECT strftime('%Y%m%d','now','localtime') AS d").get().d;
+  const fname = `${isSale ? '本期销售明细' : '本期采购明细'}_${d.from}_${d.to}_${stamp}.xlsx`;
+  res.setHeader('Content-Type', 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet');
+  res.setHeader('Content-Disposition', `attachment; filename="period_${isSale ? 'sales' : 'purchases'}_${stamp}.xlsx"; filename*=UTF-8''${encodeURIComponent(fname)}`);
+  res.setHeader('Content-Length', buf.length);
+  res.end(buf);
 });
 
 // 报表导出：按当前所选日期段生成 Excel（.xlsx，多工作表）
