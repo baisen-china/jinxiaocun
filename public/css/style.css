@@ -175,6 +175,21 @@ button:disabled, .btn-primary:disabled, .btn-ghost:disabled, .btn-danger:disable
   .alert-tools { gap: 8px; }
 }
 
+/* 仪表盘「近 14 天销售趋势」顶部的 4 个快捷报表按钮 */
+.report-quick { display: flex; flex-wrap: wrap; gap: 8px; margin-bottom: 14px; }
+.report-quick .btn-ghost { font-size: 12.5px; }
+
+/* 销售 / 采购 年报 · 月报 报表弹窗 */
+.modal.modal-rpt { max-width: 1080px; padding: 24px 26px; }
+.modal-rpt .modal-head { margin-bottom: 14px; }
+.modal-rpt .modal-head .mt { font-size: 18px; }
+.modal-rpt .table-wrap { max-height: 60vh; overflow-y: auto; }
+.modal-rpt .grid.cols-4 { gap: 10px; }
+@media (max-width: 768px) {
+  .modal-rpt { padding: 18px 14px; }
+  .modal-rpt .table-wrap { max-height: 52vh; }
+}
+
 /* 往来单位交易清单弹窗（用 .modal.modal-tx 提高优先级，覆盖 .modal 的 560px 宽度） */
 .modal.modal-tx { max-width: 1080px; padding: 24px 26px; }
 .modal-tx .modal-head { margin-bottom: 16px; }
