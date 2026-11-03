@@ -1716,18 +1716,24 @@
     const title = `${label}台账`;
     const search = ($('#p-search') && $('#p-search').value.trim()) || '';
     const head = isSup
-      ? ['名称', '联系人', '电话', '地址', '备注']
+      ? ['名称', '联系人', '电话', '地址', '备注', '应付款', '预付款']
       : ['名称', '联系人', '电话', '地址', '备注', '授信额度', '当前应收', '预收款', '可用额度'];
     const body = rows.map(r => isSup
-      ? `<tr><td>${esc(r.name || '')}</td><td>${esc(r.contact || '-')}</td><td>${esc(r.phone || '-')}</td><td>${esc(r.address || '-')}</td><td>${esc(r.note || '-')}</td></tr>`
+      ? `<tr><td>${esc(r.name || '')}</td><td>${esc(r.contact || '-')}</td><td>${esc(r.phone || '-')}</td><td>${esc(r.address || '-')}</td><td>${esc(r.note || '-')}</td>
+         <td class="num"><b>${yuan(r.payable)}</b></td>
+         <td class="num">${r.advance > 0.001 ? yuan(r.advance) : '—'}</td></tr>`
       : `<tr><td>${esc(r.name || '')}</td><td>${esc(r.contact || '-')}</td><td>${esc(r.phone || '-')}</td><td>${esc(r.address || '-')}</td><td>${esc(r.note || '-')}</td>
          <td class="num">${yuan(r.credit_limit)}</td><td class="num">${yuan(r.receivable)}</td>
          <td class="num">${r.advance > 0.001 ? yuan(r.advance) : '—'}</td><td class="num">${yuan(r.available)}</td></tr>`).join('');
-    const tfoot = isSup ? '' : `<tfoot><tr><td colspan="6">合计</td>
-      <td class="num">${yuan(rows.reduce((s, r) => s + (Number(r.credit_limit) || 0), 0))}</td>
-      <td class="num">${yuan(rows.reduce((s, r) => s + (Number(r.receivable) || 0), 0))}</td>
-      <td class="num">${yuan(rows.reduce((s, r) => s + (Number(r.advance) || 0), 0))}</td>
-      <td class="num">${yuan(rows.reduce((s, r) => s + (Number(r.available) || 0), 0))}</td></tr></tfoot>`;
+    const sumOf = (k) => rows.reduce((s, r) => s + (Number(r[k]) || 0), 0);
+    const tfoot = isSup
+      ? `<tfoot><tr><td colspan="6">合计</td>
+          <td class="num">${yuan(sumOf('payable'))}</td><td class="num">${yuan(sumOf('advance'))}</td></tr></tfoot>`
+      : `<tfoot><tr><td colspan="6">合计</td>
+          <td class="num">${yuan(sumOf('credit_limit'))}</td>
+          <td class="num">${yuan(sumOf('receivable'))}</td>
+          <td class="num">${yuan(sumOf('advance'))}</td>
+          <td class="num">${yuan(sumOf('available'))}</td></tr></tfoot>`;
 
     const html = `<!doctype html><html lang="zh-CN"><head><meta charset="utf-8">
 <title>${esc((brand ? brand + ' · ' : '') + title)}</title>
@@ -1750,11 +1756,13 @@
 <div class="meta">共 ${rows.length} 家${label}${search ? `　｜　搜索：${esc(search)}` : ''}<br>
 打印时间：${esc(new Date().toLocaleString('zh-CN', { hour12: false }))}</div>
 <table>
-  <thead><tr>${head.map(h => `<th${h.match(/额度|应收|预收/) ? ' class="num"' : ''}>${h}</th>`).join('')}</tr></thead>
+  <thead><tr>${head.map(h => `<th${h.match(/额度|应收|应付|预收|预付/) ? ' class="num"' : ''}>${h}</th>`).join('')}</tr></thead>
   <tbody>${body}</tbody>
   ${tfoot}
 </table>
-<div class="foot">口径说明：当前应收 = 该${label}所有未退单的销售单金额 − 已分摊收款；预收款 = 已收但尚未分摊到任何单据的余额，先冲抵应收后才占用授信额度；可用额度 = 授信额度 − max(0, 应收 − 预收款)。</div>
+<div class="foot">${isSup
+      ? '口径说明：应付款 = 该供应商所有未退单采购单金额 − 已分摊付款，即当前还欠他的钱；预付款 = 已付出去但尚未分摊到任何采购单的余额（多付 / 预付），是「我先垫给他的钱」，与应付是两笔不同性质的钱。列表按应付款从高到低排序。'
+      : '口径说明：当前应收 = 该客户所有未退单的销售单金额 − 已分摊收款；预收款 = 已收但尚未分摊到任何单据的余额，先冲抵应收后才占用授信额度；可用额度 = 授信额度 − max(0, 应收 − 预收款)。列表按应收金额从高到低排序。'}</div>
 <div class="sign"><span>制表：____________</span><span>复核：____________</span></div>
 </body></html>`;
     openPrintWindow(html);
@@ -1783,17 +1791,20 @@
     // 注意：这里传进来的是路由名，客户是复数 customers（不是 customer）。
     // 早先写成 kind === 'customer'，条件永远不成立，导致客户页的授信/应收/预收款/可用额度四列一直没渲染出来。
     const isCustomer = kind === 'customers';
-    const creditHead = isCustomer
+    // 供应商看「我还欠他多少（应付款）」+「我先付出去还没用掉的钱（预付款）」；
+    // 客户看「他还欠我多少（当前应收）」+「他先付过来还没用掉的钱（预收款）」+ 授信。
+    const moneyHead = isCustomer
       ? `<th class="num">授信额度</th><th class="num">当前应收</th><th class="num">预收款</th><th class="num">可用额度</th>`
-      : '';
+      : `<th class="num">应付款</th><th class="num">预付款</th>`;
+    const advCell = (r) => r.advance > 0.001 ? `<span class="tag ok">${yuan(r.advance)}</span>` : '<span class="muted">—</span>';
     // 可用额度 = 授信额度 - max(0, 应收 - 预收款)：预收款是客户已经交过的钱，先冲抵欠款，剩下的才占额度
-    const creditBody = (r) => isCustomer
+    const moneyBody = (r) => isCustomer
       ? `<td class="num">${yuan(r.credit_limit)}</td><td class="num">${yuan(r.receivable)}</td>
-         <td class="num">${r.advance > 0.001 ? `<span class="tag ok">${yuan(r.advance)}</span>` : '<span class="muted">—</span>'}</td>
+         <td class="num">${advCell(r)}</td>
          <td class="num ${r.available < -0.001 ? 'danger' : ''}" title="授信占用 ${yuan(r.credit_used)}">${yuan(r.available)}</td>`
-      : '';
-    return `<table><thead><tr><th>名称</th><th>联系人</th><th>电话</th><th>地址</th><th>备注</th>${creditHead}<th>操作</th></tr></thead><tbody>
-      ${rows.map(r => `<tr data-id="${r.id}"><td><a href="javascript:void 0" class="pname" data-act="tx" data-id="${r.id}" title="点击查看交易清单">${esc(r.name)}</a></td><td>${esc(r.contact || '-')}</td><td>${esc(r.phone || '-')}</td><td>${esc(r.address || '-')}</td><td>${esc(r.note || '-')}</td>${creditBody(r)}
+      : `<td class="num"><b>${yuan(r.payable)}</b></td><td class="num">${advCell(r)}</td>`;
+    return `<table><thead><tr><th>名称</th><th>联系人</th><th>电话</th><th>地址</th><th>备注</th>${moneyHead}<th>操作</th></tr></thead><tbody>
+      ${rows.map(r => `<tr data-id="${r.id}"><td><a href="javascript:void 0" class="pname" data-act="tx" data-id="${r.id}" title="点击查看交易清单">${esc(r.name)}</a></td><td>${esc(r.contact || '-')}</td><td>${esc(r.phone || '-')}</td><td>${esc(r.address || '-')}</td><td>${esc(r.note || '-')}</td>${moneyBody(r)}
         <td><button class="btn-ghost small" data-act="edit">编辑</button> <button class="btn-danger" data-act="del">删除</button></td></tr>`).join('')}
     </tbody></table>`;
   }
@@ -2911,7 +2922,7 @@
         <div class="grid cols-4">
           <div class="stat warn"><div class="label">应付总额（未付）</div><div class="value">${yuan(ar.purchase.outstanding)}</div><div class="sub">已付 ${yuan(ar.purchase.paid)} / 共 ${yuan(ar.purchase.total)}</div></div>
         </div>
-        <div class="card" style="margin-top:16px"><div class="card-title">应付未付 · 按供应商（含直采）</div>${repSummaryTable(ar.suppliers, 'supplier')}</div>`;
+        <div class="card" style="margin-top:16px"><div class="card-title">应付未付 · 按供应商（含直采，按应付金额从高到低）</div>${repSummaryTable(ar.suppliers, 'supplier')}</div>`;
       if ($('#rep-back')) $('#rep-back').onclick = () => gotoReport(null);
       $$('#content [data-detail]').forEach(b => b.onclick = () => gotoReport({ kind: 'supplier', id: parseInt(b.dataset.detail) }));
       bindPeriod();
@@ -2922,7 +2933,7 @@
         <div class="grid cols-4">
           <div class="stat good"><div class="label">应收总额（未收）</div><div class="value">${yuan(ar.sale.outstanding)}</div><div class="sub">已收 ${yuan(ar.sale.received)} / 共 ${yuan(ar.sale.total)}</div></div>
         </div>
-        <div class="card" style="margin-top:16px"><div class="card-title">应收未收 · 按客户（含散客）</div>${repSummaryTable(ar.customers, 'customer')}</div>`;
+        <div class="card" style="margin-top:16px"><div class="card-title">应收未收 · 按客户（含散客，按应收金额从高到低）</div>${repSummaryTable(ar.customers, 'customer')}</div>`;
       if ($('#rep-back')) $('#rep-back').onclick = () => gotoReport(null);
       $$('#content [data-detail]').forEach(b => b.onclick = () => gotoReport({ kind: 'customer', id: parseInt(b.dataset.detail) }));
       bindPeriod();

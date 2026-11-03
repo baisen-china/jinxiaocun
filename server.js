@@ -1045,30 +1045,54 @@ app.delete('/api/products/:id', requireAdmin, (req, res) => {
 // ---------- 供应商 ----------
 // 列表查询抽成函数：页面（/api/suppliers）与导出（/api/suppliers/export）共用同一份 SQL，
 // 避免「屏幕上筛出来的」和「导出的 Excel」不是同一批数据、甚至顺序都不同。
+//
+// 「应付款」= 该供应商所有未退单采购单金额 − 已分摊的付款，也就是当前还欠他多少；
+// 「预付款」= 已经付出去、但还没分摊到任何采购单的余额（多付 / 预付）。
+// 两者性质完全不同，必须分列：只看到应付款，会以为还要再掏这么多现金，其实账上还压着预付款。
+// 排序：应付款从高到低（同额再按累计采购额，最后按 id），让欠得最多的供应商永远排在最上面。
 function supplierList(search) {
-  let sql = 'SELECT * FROM suppliers WHERE 1=1'; const params = [];
-  if (search) { sql += ' AND (name LIKE ? OR contact LIKE ? OR phone LIKE ?)'; const s = `%${search}%`; params.push(s, s, s); }
-  sql += ' ORDER BY id DESC';
-  return db.prepare(sql).all(...params);
+  let where = 'WHERE 1=1'; const params = [];
+  if (search) { where += ' AND (s.name LIKE ? OR s.contact LIKE ? OR s.phone LIKE ?)'; const s = `%${search}%`; params.push(s, s, s); }
+  const sql = `SELECT s.*,
+    COALESCE(SUM(p.total_amount),0) AS purchase_total,
+    COALESCE(SUM(p.total_amount - (SELECT COALESCE(SUM(amount),0) FROM payment_allocations WHERE doc_type='purchase' AND doc_id=p.id)),0) AS payable
+    FROM suppliers s
+    LEFT JOIN purchases p ON p.supplier_id = s.id AND (p.status IS NULL OR p.status != 'returned')
+    ${where}
+    GROUP BY s.id
+    ORDER BY payable DESC, purchase_total DESC, s.id ASC`;
+  const advMap = advanceMapOf('supplier');
+  return db.prepare(sql).all(...params).map(r => ({
+    ...r,
+    purchase_total: r2(r.purchase_total),
+    payable: r2(r.payable),
+    advance: advMap.get(r.id) || 0
+  }));
 }
 
 app.get('/api/suppliers', requireAuth, (req, res) => res.json(supplierList(String(req.query.search || '').trim())));
 
-// 导出供应商清单（仅管理员）：列顺序与页面表格一致
+// 导出供应商清单（仅管理员）：列顺序与页面表格一致（含当前应付 / 预付款，顺序同为应付从高到低）
 app.get('/api/suppliers/export', requireAuth, (req, res) => {
   if (!isAdminSession(req)) return res.status(403).json({ error: '仅管理员可导出供应商清单' });
   const search = String(req.query.search || '').trim();
   const rows = supplierList(search);
   if (!rows.length) return res.status(400).json({ error: '当前筛选条件下没有供应商，无法导出' });
-  const body = rows.map((s, i) => [i + 1, s.name || '', s.contact || '', s.phone || '', s.address || '', s.note || '']);
+  const body = rows.map((s, i) => [
+    i + 1, s.name || '', s.contact || '', s.phone || '', s.address || '', s.note || '',
+    r2(s.payable), r2(s.advance)
+  ]);
+  const sum = (k) => r2(rows.reduce((s, x) => s + (Number(x[k]) || 0), 0));
   const sheets = [{
     name: '供应商清单',
     rows: [
       ['供应商清单'],
       [`导出时间：${nowLocal()}　｜　共 ${rows.length} 家供应商${search ? `　｜　搜索：${search}` : ''}`],
       [],
-      ['序号', '供应商名称', '联系人', '电话', '地址', '备注'],
-      ...body
+      ['序号', '供应商名称', '联系人', '电话', '地址', '备注', '应付款(未付)', '预付款(未用)'],
+      ...body,
+      [],
+      ['合计', `${rows.length} 家供应商`, '', '', '', '', sum('payable'), sum('advance')]
     ]
   }];
   let buf;
@@ -1127,13 +1151,15 @@ function customerList(search) {
   if (search) { where += ' AND (c.name LIKE ? OR c.contact LIKE ? OR c.phone LIKE ?)'; const s = `%${search}%`; params.push(s, s, s); }
   // 应收只排除「已退单」：退单待审（pending_return）的货还没退、钱也没退，
   // 债权债务依然成立，必须计入应收与授信占用，否则客户提了退单申请就能凭空释放额度。
+  // 排序：应收从高到低（同额按累计销售额、最后按 id），欠得最多的客户排最上面。
   const sql = `SELECT c.*,
+    COALESCE(SUM(s.total_amount),0) AS sale_total,
     COALESCE(SUM(s.total_amount - (SELECT COALESCE(SUM(amount),0) FROM payment_allocations WHERE doc_type='sale' AND doc_id=s.id)),0) AS receivable
     FROM customers c
     LEFT JOIN sales s ON s.customer_id = c.id AND (s.status IS NULL OR s.status != 'returned')
     ${where}
     GROUP BY c.id
-    ORDER BY c.id DESC`;
+    ORDER BY receivable DESC, sale_total DESC, c.id ASC`;
   const advMap = advanceMapOf('customer');
   return db.prepare(sql).all(...params).map(r => {
     const limit = r.credit_limit == null ? 100000 : r2(r.credit_limit);
@@ -1141,7 +1167,7 @@ function customerList(search) {
     const advance = advMap.get(r.id) || 0;
     // 预收款是客户「已经付过的钱」，先用它冲抵欠款，剩下的部分才占用授信额度
     const used = Math.max(0, r2(receivable - advance));
-    return { ...r, credit_limit: limit, receivable, advance, credit_used: used, available: r2(limit - used) };
+    return { ...r, sale_total: r2(r.sale_total), credit_limit: limit, receivable, advance, credit_used: used, available: r2(limit - used) };
   });
 }
 
@@ -3523,6 +3549,15 @@ function computeArAp() {
   if (r2(retail.total) > 0.001 || r2(retail.receivable) > 0.001) {
     cus.push({ id: 0, name: '散客（未指定客户）', total: r2(retail.total), received: r2(retail.total - retail.receivable), receivable: r2(retail.receivable), advance: 0, credit_limit: null, over_limit: false, unlinked: true });
   }
+  // 「应收未收 / 应付未付」两张表统一按金额从高到低排（同额按累计发生额，最后按名称），
+  // 直采 / 散客也是真实的应收应付，一起参与排序，不能因为「没有往来单位」就永远钉在表尾。
+  // SQL 里已按金额排过序，这里再排一次是为了把后追加的直采 / 散客行并入正确位置，
+  // 并给出确定的次序（金额相同时不至于每次刷新顺序都在变）。
+  const byAmountDesc = (key) => (a, b) => (r2(b[key]) - r2(a[key]))
+    || (r2(b.total) - r2(a.total))
+    || String(a.name).localeCompare(String(b.name), 'zh-Hans-CN');
+  sup.sort(byAmountDesc('payable'));
+  cus.sort(byAmountDesc('receivable'));
   const purchaseTotal = r2(sum(sup, 'total')), purchasePaid = r2(sum(sup, 'paid')), purchaseOutstanding = r2(sum(sup, 'payable'));
   const saleTotal = r2(sum(cus, 'total')), saleReceived = r2(sum(cus, 'received')), saleOutstanding = r2(sum(cus, 'receivable'));
   const totalAdvancePay = r2(sum(sup, 'advance')), totalAdvanceReceive = r2(sum(cus, 'advance'));
