@@ -4313,6 +4313,125 @@ app.get('/api/reports/period/export', requireAuth, (req, res) => {
   res.end(buf);
 });
 
+// 销售 / 采购 年报·月报 的「按月份 / 按天」汇总：每个桶（月或日）一行，
+// 含总额、已收/已付、未收/未付、利润（销售）、单量；空桶补 0 保证曲线连续。
+// 与 periodData 同一套过滤口径（排除 return 单、日期段写反自动交换）。
+function summaryData(query) {
+  const q = query || {};
+  const isSale = String(q.kind || 'sale') !== 'purchase';
+  const byDay = String(q.granularity || 'month') === 'day';
+  let from = String(q.from || '').trim();
+  let to = String(q.to || '').trim();
+  const nowMonth = db.prepare(`SELECT strftime('%Y-%m','now','localtime') AS p`).get().p;
+  if (!from) from = nowMonth + '-01';
+  if (!to) to = db.prepare(`SELECT date('now','localtime') AS d`).get().d;
+  if (from > to) { const t = from; from = to; to = t; } // 容错：起止颠倒自动交换
+  const label = `${from} ~ ${to}`;
+  const table = isSale ? 'sales' : 'purchases';
+  const allocDoc = isSale ? 'sale' : 'purchase';
+  const fmt = byDay ? '%Y-%m-%d' : '%Y-%m';
+
+  // 生成区间内所有桶（含空桶，保证曲线连续）
+  const buckets = [];
+  if (byDay) {
+    let cur = new Date(from + 'T00:00:00');
+    const end = new Date(to + 'T00:00:00');
+    while (cur <= end) {
+      const y = cur.getFullYear(), mo = cur.getMonth() + 1, dd = cur.getDate();
+      const key = `${y}-${String(mo).padStart(2, '0')}-${String(dd).padStart(2, '0')}`;
+      buckets.push({ key, label: `${mo}/${dd}` });
+      cur.setDate(cur.getDate() + 1);
+    }
+  } else {
+    let [y, m] = from.split('-').map(Number);
+    const [ty, tm] = to.split('-').map(Number);
+    while (y < ty || (y === ty && m <= tm)) {
+      buckets.push({ key: `${y}-${String(m).padStart(2, '0')}`, label: `${y}年${m}月` });
+      m++; if (m > 12) { m = 1; y++; }
+    }
+  }
+
+  const sumStmt = db.prepare(`
+    SELECT COALESCE(SUM(s.total_amount),0) AS amount,
+           COALESCE(SUM((SELECT COALESCE(SUM(amount),0) FROM payment_allocations WHERE doc_type='${allocDoc}' AND doc_id=s.id)),0) AS settled
+           ${isSale ? ', COALESCE(SUM(s.total_profit),0) AS profit' : ''}
+    FROM ${table} s
+    WHERE strftime('${fmt}', s.created_at) = ?
+      AND (s.status IS NULL OR s.status != 'returned')`);
+  const cntStmt = db.prepare(`SELECT COUNT(*) c FROM ${table} s WHERE strftime('${fmt}', s.created_at) = ? AND (s.status IS NULL OR s.status != 'returned')`);
+
+  const rows = buckets.map((b) => {
+    const r = sumStmt.get(b.key);
+    const amount = r2(r.amount);
+    const settled = r2(r.settled);
+    const profit = isSale ? r2(r.profit) : 0;
+    return {
+      key: b.key, label: b.label,
+      amount, settled, outstanding: r2(amount - settled), profit,
+      count: cntStmt.get(b.key).c
+    };
+  });
+
+  const total = rows.reduce((a, b) => ({
+    amount: a.amount + b.amount, settled: a.settled + b.settled,
+    outstanding: a.outstanding + b.outstanding, profit: a.profit + b.profit, count: a.count + b.count
+  }), { amount: 0, settled: 0, outstanding: 0, profit: 0, count: 0 });
+
+  return {
+    kind: isSale ? 'sale' : 'purchase', granularity: byDay ? 'day' : 'month',
+    from, to, period: label,
+    buckets: rows,
+    total: {
+      amount: r2(total.amount), settled: r2(total.settled),
+      outstanding: r2(total.outstanding), profit: r2(total.profit), count: total.count
+    }
+  };
+}
+
+app.get('/api/reports/summary', requireAuth, (req, res) => {
+  res.json(summaryData(req.query));
+});
+
+// 汇总表导出 Excel（与页面汇总表同源）
+app.get('/api/reports/summary/export', requireAuth, (req, res) => {
+  const d = summaryData(req.query);
+  const isSale = d.kind === 'sale';
+  const byDay = d.granularity === 'day';
+  const brand = getSettings().branding;
+  const dim = isSale ? '销售' : '采购';
+  const unit = byDay ? '日' : '月';
+  const who = isSale ? '已收' : '已付';
+  const due = isSale ? '未收' : '未付';
+  const head = isSale
+    ? [unit + '份', dim + '额', who, due, '利润', '单量']
+    : [unit + '份', dim + '额', who, due, '单量'];
+  const rows = [
+    [`${brand.shopName || ''} · ${dim}${unit}报汇总（${d.period}）`],
+    [`导出时间：${nowLocal()}　｜　共 ${d.buckets.length} 个${unit}份　｜　合计${dim}额 ${r2(d.total.amount)}` + (isSale ? `　｜　利润 ${r2(d.total.profit)}` : '')],
+    [],
+    head
+  ];
+  for (const b of d.buckets) {
+    rows.push(isSale
+      ? [b.label, b.amount, b.settled, b.outstanding, b.profit, b.count]
+      : [b.label, b.amount, b.settled, b.outstanding, b.count]);
+  }
+  rows.push([]);
+  rows.push(isSale
+    ? ['合计', r2(d.total.amount), r2(d.total.settled), r2(d.total.outstanding), r2(d.total.profit), d.total.count]
+    : ['合计', r2(d.total.amount), r2(d.total.settled), r2(d.total.outstanding), d.total.count]);
+
+  let buf;
+  try { buf = buildWorkbook([{ name: `${dim}${unit}报汇总`, rows }]); }
+  catch (e) { return res.status(500).json({ error: '生成 Excel 失败：' + e.message }); }
+  const stamp = db.prepare("SELECT strftime('%Y%m%d','now','localtime') AS d").get().d;
+  const fname = `${dim}${unit}报汇总_${d.from}_${d.to}_${stamp}.xlsx`;
+  res.setHeader('Content-Type', 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet');
+  res.setHeader('Content-Disposition', `attachment; filename="summary_${isSale ? 'sales' : 'purchases'}_${stamp}.xlsx"; filename*=UTF-8''${encodeURIComponent(fname)}`);
+  res.setHeader('Content-Length', buf.length);
+  res.end(buf);
+});
+
 // 报表导出：按当前所选日期段生成 Excel（.xlsx，多工作表）
 // ==================== 退单报表 / 改价报表 ====================
 // 统一的日期段解析：from/to 缺失时默认「本月 1 日 ~ 今天」，写反自动交换

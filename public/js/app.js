@@ -1688,8 +1688,10 @@
     // 年报默认：本年 1/1 ~ 今天；月报默认：当月 1 日 ~ 当月末（整月；未来日期无数据，自动为空）
     const defFrom = isAnnual ? `${y}-01-01` : `${y}-${pad(mo)}-01`;
     const defTo = isAnnual ? today : fmtMonthEnd(y, mo);
+    const gran = isAnnual ? 'month' : 'day';     // 年报按月汇总，月报按天汇总
+    const unit = isAnnual ? '月' : '日';
 
-    const cur = { from: defFrom, to: defTo }; // 当前查询区间，打印/导出复用
+    const cur = { from: defFrom, to: defTo, gran }; // 当前查询区间，打印/导出复用
 
     const filterBar = isAnnual
       ? `<label>起始<input type="date" id="rpt-from" value="${defFrom}" class="input-sm"></label>
@@ -1697,7 +1699,7 @@
       : `<label>月份<input type="month" id="rpt-month" value="${monthVal}" class="input-sm"></label>`;
 
     const m = modal(`<div class="modal-head">
-        <div><div class="mt">${esc(title)}</div><div class="ms">${isSale ? '销售' : '采购'}单据汇总，可改时间段后重新查询</div></div>
+        <div><div class="mt">${esc(title)}</div><div class="ms">${isSale ? '销售' : '采购'}${isAnnual ? '年报（按月汇总）' : '月报（按天汇总）'}，可改${isAnnual ? '时间段' : '月份'}后重新查询</div></div>
       </div>
       <div class="filter-bar">
         ${filterBar}
@@ -1728,8 +1730,9 @@
       const body = m.root.querySelector('#rpt-body');
       body.innerHTML = '<p class="empty">加载中…</p>';
       try {
-        const d = await api('GET', `/api/reports/period?from=${encodeURIComponent(cur.from)}&to=${encodeURIComponent(cur.to)}`);
-        body.innerHTML = rptBodyHtml(d, isSale, title, cur.from, cur.to);
+        const d = await api('GET', `/api/reports/summary?kind=${isSale ? 'sale' : 'purchase'}&granularity=${gran}&from=${encodeURIComponent(cur.from)}&to=${encodeURIComponent(cur.to)}`);
+        body.innerHTML = rptSummaryHtml(d, isSale);
+        bindRptDetail(m, isSale, cur);
       } catch (e) {
         body.innerHTML = `<p class="empty">加载失败：${esc(e.message || e)}</p>`;
       }
@@ -1740,8 +1743,11 @@
       const btn = m.root.querySelector('#rpt-print'); btn.disabled = true;
       try {
         readRange();
-        const d = await api('GET', `/api/reports/period?from=${encodeURIComponent(cur.from)}&to=${encodeURIComponent(cur.to)}`);
-        printPeriodReport(title, d, isSale);
+        const [sum, det] = await Promise.all([
+          api('GET', `/api/reports/summary?kind=${isSale ? 'sale' : 'purchase'}&granularity=${gran}&from=${encodeURIComponent(cur.from)}&to=${encodeURIComponent(cur.to)}`),
+          api('GET', `/api/reports/period?from=${encodeURIComponent(cur.from)}&to=${encodeURIComponent(cur.to)}`)
+        ]);
+        printSummaryReport(title, sum, det, isSale);
       } catch (e) { toast(e.message || e, true); }
       btn.disabled = false;
     };
@@ -1749,8 +1755,8 @@
       const btn = m.root.querySelector('#rpt-export'); btn.disabled = true;
       try {
         readRange();
-        const qs = `kind=${isSale ? 'sale' : 'purchase'}&from=${encodeURIComponent(cur.from)}&to=${encodeURIComponent(cur.to)}`;
-        const res = await fetch(`/api/reports/period/export?${qs}`, { credentials: 'same-origin' });
+        const qs = `kind=${isSale ? 'sale' : 'purchase'}&granularity=${gran}&from=${encodeURIComponent(cur.from)}&to=${encodeURIComponent(cur.to)}`;
+        const res = await fetch(`/api/reports/summary/export?${qs}`, { credentials: 'same-origin' });
         if (!res.ok) { let msg = '导出失败'; try { const j = await res.json(); msg = j.error || msg; } catch (e) {} throw new Error(msg); }
         const blob = await res.blob();
         downloadBlob(blob, `${esc(title)}_${cur.from}_${cur.to}_${fileStamp()}.xlsx`);
@@ -1800,6 +1806,170 @@
     const tfoot = `<tr>${tot.map((c, i) => i < 3 ? `<td><b>${esc(c)}</b></td>` : `<td class="num"><b>${yuan(c)}</b></td>`).join('')}</tr>`;
 
     return stats + `<div class="table-wrap" style="margin-top:12px"><table><thead><tr>${head.map((h) => `<th class="${['金额', '定金(约定)', sett, due, '利润'].includes(h) ? 'num' : ''}">${h}</th>`).join('')}</tr></thead><tbody>${rows}</tbody><tfoot>${tfoot}</tfoot></table></div>`;
+  }
+
+  // 汇总曲线图：按月份 / 按天的折线（销售额 + 利润（销售）），空桶已补 0，曲线天然连续
+  function summaryLineChart(buckets, isSale) {
+    if (!buckets || !buckets.length) return '';
+    const byDay = buckets[0].key.length > 7; // YYYY-MM(7) vs YYYY-MM-DD(10)
+    const multiYear = buckets[0].key.slice(0, 4) !== buckets[buckets.length - 1].key.slice(0, 4);
+    const cl = (b) => byDay ? b.label : (multiYear ? b.label.replace('年', '-').replace('月', '') : b.label.replace(/^\d+年/, ''));
+    const w = 640, h = 320, P = { l: 60, r: 16, t: 16, b: 34 };
+    const iw = w - P.l - P.r, ih = h - P.t - P.b;
+    const maxV = Math.max(1, ...buckets.map(b => Math.max(Number(b.amount) || 0, isSale ? (Number(b.profit) || 0) : 0)));
+    const step = niceStep(maxV / 3);
+    const top = Math.max(step * 3, Math.ceil(maxV / step) * step);
+    const X = (i) => P.l + (iw * i) / Math.max(1, buckets.length - 1);
+    const Y = (v) => P.t + ih - (ih * (Number(v) || 0)) / top;
+    const poly = (k) => buckets.map((b, i) => `${X(i).toFixed(1)},${Y(b[k]).toFixed(1)}`).join(' ');
+    const area = `${P.l},${P.t + ih} ${poly('amount')} ${X(buckets.length - 1).toFixed(1)},${P.t + ih}`;
+    const grid = [0, 1, 2, 3].map(k => {
+      const gy = P.t + ih - (ih * k) / 3;
+      return `<line x1="${P.l}" y1="${gy.toFixed(1)}" x2="${w - P.r}" y2="${gy.toFixed(1)}" stroke="#eef2f7"/>
+        <text x="${P.l - 8}" y="${(gy + 3.5).toFixed(1)}" font-size="10" fill="#8a94a6" text-anchor="end">${k === 0 ? '0' : shortMoney((top * k) / 3)}</text>`;
+    }).join('');
+    const everyN = Math.max(1, Math.ceil(buckets.length / 12));
+    const labels = buckets.map((b, i) => (i % everyN === 0 || i === buckets.length - 1)
+      ? `<text x="${X(i).toFixed(1)}" y="${h - 10}" font-size="10" fill="#8a94a6" text-anchor="middle">${esc(cl(b))}</text>` : '').join('');
+    const dots = buckets.map((b, i) => `<circle cx="${X(i).toFixed(1)}" cy="${Y(b.amount).toFixed(1)}" r="2.6" fill="#2563eb"><title>${esc(b.label)}｜${isSale ? '销售' : '采购'} ${yuan(b.amount)}${isSale ? `｜利润 ${yuan(b.profit)}` : ''}</title></circle>`).join('');
+    const sumAmt = buckets.reduce((s, b) => s + (Number(b.amount) || 0), 0);
+    const sumPft = buckets.reduce((s, b) => s + (Number(b.profit) || 0), 0);
+    const best = buckets.reduce((a, b) => (Number(b.amount) > Number(a.amount) ? b : a), buckets[0]);
+    const legend = isSale
+      ? `<span><i style="background:#2563eb"></i>销售额</span><span><i style="background:#f59e0b"></i>利润</span>`
+      : `<span><i style="background:#2563eb"></i>采购额</span>`;
+    return `<div class="chart-legend">${legend}<span class="muted">单位：元，悬停看每${byDay ? '天' : '月'}明细</span></div>
+      <svg viewBox="0 0 ${w} ${h}" style="width:100%;height:auto">
+        ${grid}
+        <polygon points="${area}" fill="#eff4ff"/>
+        <polyline points="${poly('amount')}" fill="none" stroke="#2563eb" stroke-width="2" stroke-linejoin="round"/>
+        ${isSale ? `<polyline points="${poly('profit')}" fill="none" stroke="#f59e0b" stroke-width="1.6" stroke-dasharray="4 3" stroke-linejoin="round"/>` : ''}
+        <line x1="${P.l}" y1="${P.t + ih}" x2="${w - P.r}" y2="${P.t + ih}" stroke="#dbe3ee"/>
+        ${dots}${labels}
+      </svg>
+      <div class="chart-stats">
+        <div><span class="muted">合计</span><b>${yuan(sumAmt)}</b></div>
+        <div><span class="muted">${byDay ? '日均' : '月均'}</span><b>${yuan(buckets.length ? sumAmt / buckets.length : 0)}</b></div>
+        <div><span class="muted">最高${byDay ? '单日' : '单月'}</span><b>${yuan(best.amount)}<i class="muted"> ${esc(best.label)}</i></b></div>
+        ${isSale ? `<div><span class="muted">利润合计</span><b class="${sumPft < 0 ? 'danger' : ''}">${yuan(sumPft)}</b></div>` : ''}
+      </div>`;
+  }
+
+  // 汇总报表主体：统计卡 + 曲线图 + 汇总表（按月份 / 按天）+ 可展开的明细
+  function rptSummaryHtml(d, isSale) {
+    const byDay = d.granularity === 'day';
+    const unitCol = byDay ? '日期' : '月份';
+    const dim = isSale ? '销售' : '采购';
+    const who = isSale ? '已收' : '已付';
+    const due = isSale ? '未收' : '未付';
+    const t = d.total;
+    const stats = `<div class="grid cols-4">
+      <div class="stat"><div class="label">${unitCol}数</div><div class="value">${intf(d.buckets.length)}</div></div>
+      <div class="stat"><div class="label">${dim}单量</div><div class="value">${intf(t.count)}</div></div>
+      <div class="stat"><div class="label">${dim}总额</div><div class="value">${yuan(t.amount)}</div></div>
+      ${isSale ? `<div class="stat accent"><div class="label">利润合计</div><div class="value">${yuan(t.profit)}</div></div>` : `<div class="stat"><div class="label">${who}合计</div><div class="value">${yuan(t.settled)}</div></div>`}
+    </div>`;
+    const chart = summaryLineChart(d.buckets, isSale);
+    const head = isSale
+      ? [unitCol, '销售额', who, due, '利润', '单量']
+      : [unitCol, dim + '额', who, due, '单量'];
+    const rows = d.buckets.length ? d.buckets.map((b) => {
+      const cells = [b.label, b.amount, b.settled, b.outstanding, b.count];
+      if (isSale) cells.splice(4, 0, b.profit);
+      return `<tr>${cells.map((c, i) => i === 0 ? `<td>${esc(c)}</td>` : `<td class="num">${yuan(c)}</td>`).join('')}</tr>`;
+    }).join('') : `<tr><td colspan="${head.length}"><p class="empty">该期间没有${dim}单据</p></td></tr>`;
+    const tot = isSale ? ['合计', t.amount, t.settled, t.outstanding, t.profit, t.count] : ['合计', t.amount, t.settled, t.outstanding, t.count];
+    const tfoot = `<tr>${tot.map((c, i) => i === 0 ? `<td><b>${esc(c)}</b></td>` : `<td class="num"><b>${yuan(c)}</b></td>`).join('')}</tr>`;
+    const table = `<div class="table-wrap" style="margin-top:12px"><table><thead><tr>${head.map((h) => `<th class="${['销售额', '采购额', '已收', '已付', '未收', '未付', '利润', '单量'].includes(h) ? 'num' : ''}">${h}</th>`).join('')}</tr></thead><tbody>${rows}</tbody><tfoot>${tfoot}</tfoot></table></div>`;
+    const detail = `<details class="rpt-detail" style="margin-top:14px"><summary>查看明细单据（${dim}）</summary><div id="rpt-detail-body"><p class="empty">展开后加载…</p></div></details>`;
+    return stats + chart + table + detail;
+  }
+
+  // 明细懒加载：展开时按当前区间取 period 明细
+  function bindRptDetail(m, isSale, cur) {
+    const det = m.root.querySelector('.rpt-detail');
+    if (!det) return;
+    det.addEventListener('toggle', async () => {
+      if (!det.open) return;
+      const box = m.root.querySelector('#rpt-detail-body');
+      if (box.dataset.loaded) return;
+      box.dataset.loaded = '1';
+      box.innerHTML = '<p class="empty">加载中…</p>';
+      try {
+        const d = await api('GET', `/api/reports/period?from=${encodeURIComponent(cur.from)}&to=${encodeURIComponent(cur.to)}`);
+        box.innerHTML = rptBodyHtml(d, isSale, isSale ? '销售' : '采购', cur.from, cur.to);
+      } catch (e) { box.innerHTML = `<p class="empty">加载失败：${esc(e.message || e)}</p>`; }
+    });
+  }
+
+  // 汇总报表打印：统计卡 + 曲线图 + 汇总表 + 明细清单
+  function printSummaryReport(title, sum, det, isSale) {
+    const brand = (state.branding && state.branding.shopName) || '';
+    const byDay = sum.granularity === 'day';
+    const unitCol = byDay ? '日期' : '月份';
+    const dim = isSale ? '销售' : '采购';
+    const who = isSale ? '已收' : '已付';
+    const due = isSale ? '未收' : '未付';
+    const t = sum.total;
+    const head = isSale
+      ? [unitCol, '销售额', who, due, '利润', '单量']
+      : [unitCol, dim + '额', who, due, '单量'];
+    const sumRows = sum.buckets.map((b) => {
+      const cells = [b.label, b.amount, b.settled, b.outstanding, b.count];
+      if (isSale) cells.splice(4, 0, b.profit);
+      return `<tr>${cells.map((c, i) => i === 0 ? `<td>${esc(c)}</td>` : `<td class="num">${yuan(c)}</td>`).join('')}</tr>`;
+    }).join('') || `<tr><td colspan="${head.length}">该期间没有${dim}单据</td></tr>`;
+    const tot = isSale ? ['合计', t.amount, t.settled, t.outstanding, t.profit, t.count] : ['合计', t.amount, t.settled, t.outstanding, t.count];
+    const sumTfoot = `<tfoot><tr>${tot.map((c, i) => i === 0 ? `<td>${esc(c)}</td>` : `<td class="num">${yuan(c)}</td>`).join('')}</tr></tfoot>`;
+    const chartSvg = summaryLineChart(sum.buckets, isSale);
+    const list = isSale ? det.sales : det.purchases;
+    const dHead = isSale
+      ? ['销售单号', '客户', '交易日期', '金额', '定金(约定)', who, due, '利润']
+      : ['采购单号', '供应商', '交易日期', '金额', '定金(约定)', who, due];
+    const dNum = ['金额', '定金(约定)', who, due, '利润'];
+    const dBody = list.map((r) => {
+      const settled = isSale ? r.received : r.paid;
+      const cells = [r.bill_no, r.party || (isSale ? '散客' : '直采'), (r.created_at || '').slice(0, 10),
+        r.total, r.deposit > 0.001 ? r.deposit : '', settled, r.outstanding];
+      if (isSale) cells.push(r.profit);
+      return `<tr>${cells.map((c, i) => i < 3 ? `<td>${esc(c == null ? '' : c)}</td>` : `<td class="num">${yuan(c)}</td>`).join('')}</tr>`;
+    }).join('') || `<tr><td colspan="${dHead.length}">无明细</td></tr>`;
+    const dSumK = (k) => list.reduce((s, r) => s + (Number(r[k]) || 0), 0);
+    const dTot = ['合计', `${list.length} 单`, '', dSumK('total'), '', dSumK(isSale ? 'received' : 'paid'), dSumK('outstanding')];
+    if (isSale) dTot.push(dSumK('profit'));
+    const dTfoot = `<tfoot><tr>${dTot.map((c, i) => i < 3 ? `<td>${esc(c)}</td>` : `<td class="num">${yuan(c)}</td>`).join('')}</tr></tfoot>`;
+
+    const html = `<!doctype html><html lang="zh-CN"><head><meta charset="utf-8">
+<title>${esc((brand ? brand + ' · ' : '') + title)}</title>
+<style>
+  @page { size: A4 portrait; margin: 12mm; }
+  * { box-sizing: border-box; }
+  body { font-family:"Microsoft YaHei","PingFang SC","Hiragino Sans GB",sans-serif; color:#111; font-size:12px; margin:0; padding:10px; }
+  h1 { font-size:17px; margin:0 0 4px; text-align:center; }
+  .meta { color:#555; font-size:11px; line-height:1.8; margin-bottom:8px; text-align:center; }
+  h2 { font-size:13px; margin:14px 0 6px; border-left:3px solid #2563eb; padding-left:6px; }
+  table { width:100%; border-collapse:collapse; }
+  th, td { border:1px solid #b4b4b4; padding:4px 6px; text-align:left; }
+  th { background:#efefef; font-weight:600; white-space:nowrap; }
+  .num { text-align:right; white-space:nowrap; font-variant-numeric:tabular-nums; }
+  tfoot td { font-weight:700; background:#f7f7f7; }
+  svg { width:100%; height:auto; }
+  .chart-stats { display:flex; gap:18px; flex-wrap:wrap; color:#444; font-size:11px; margin-top:4px; }
+  .foot { margin-top:8px; color:#666; font-size:10.5px; }
+  .sign { margin-top:22px; display:flex; justify-content:space-between; color:#444; font-size:12px; }
+  @media print { thead { display:table-header-group; } tr { page-break-inside:avoid; } }
+</style></head><body>
+<h1>${esc((brand ? brand + ' · ' : '') + title)}</h1>
+<div class="meta">统计期间：${esc(sum.period)}　｜　共 ${sum.buckets.length} 个${unitCol}　｜　${dim}单量 ${intf(t.count)}　｜　${dim}总额 ${yuan(t.amount)}${isSale ? `　｜　利润合计 ${yuan(t.profit)}` : ''}<br>打印时间：${esc(new Date().toLocaleString('zh-CN', { hour12: false }))}</div>
+<h2>按${unitCol}汇总</h2>
+${chartSvg}
+<div class="table-wrap" style="margin-top:8px"><table><thead><tr>${head.map((h) => `<th class="${['销售额', '采购额', '已收', '已付', '未收', '未付', '利润', '单量'].includes(h) ? 'num' : ''}">${h}</th>`).join('')}</tr></thead><tbody>${sumRows}</tbody>${sumTfoot}</table></div>
+<h2>${dim}明细单据</h2>
+<table><thead><tr>${dHead.map((h) => `<th class="${dNum.includes(h) ? 'num' : ''}">${h}</th>`).join('')}</tr></thead><tbody>${dBody}</tbody>${dTfoot}</table>
+<div class="foot">口径说明：${isSale ? '利润 = 各销售单记录的利润之和；已收/未收按单据实际收付款结算。' : '已付/未付按单据实际收付款结算。'} 数据来源：进销存系统。</div>
+<div class="sign"><span>制表：____________</span><span>复核：____________</span></div>
+</body></html>`;
+    openPrintWindow(html);
   }
 
   // 报表打印：独立 A4 窗口，复用经营报表的打印样式
