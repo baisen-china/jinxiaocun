@@ -1685,9 +1685,9 @@
     const y = now.getFullYear(), mo = now.getMonth() + 1, d = now.getDate();
     const today = fmt(now);
     const monthVal = `${y}-${pad(mo)}`;
-    // 年报默认：本年 1/1 ~ 今天；月报默认：当月 1 日 ~ 当月末（整月；未来日期无数据，自动为空）
+    // 年报默认：本年 1/1 ~ 今天；月报默认：所选月份 1 日 ~ 今天（进行中的月份不统计未来未发生日期）
     const defFrom = isAnnual ? `${y}-01-01` : `${y}-${pad(mo)}-01`;
-    const defTo = isAnnual ? today : fmtMonthEnd(y, mo);
+    const defTo = isAnnual ? today : today;
     const gran = isAnnual ? 'month' : 'day';     // 年报按月汇总，月报按天汇总
     const unit = isAnnual ? '月' : '日';
 
@@ -1721,7 +1721,8 @@
         const parts = mv.split('-');
         const yy = parseInt(parts[0], 10), mm = parseInt(parts[1], 10);
         cur.from = `${yy}-${pad(mm)}-01`;
-        cur.to = fmtMonthEnd(yy, mm);
+        // 进行中的当前月只统计到今天（未来未发生日期不计入）；历史月份按整月
+        cur.to = (yy === y && mm === mo) ? today : fmtMonthEnd(yy, mm);
       }
     };
 
