@@ -5076,6 +5076,9 @@ function autoBackupDaily() {
       const all = list();
       all.slice(0, Math.max(0, all.length - 7)).forEach(f => { try { fs.unlinkSync(path.join(dir, f)); } catch (e) {} });
       console.log(`[备份] 已自动备份数据库：${path.relative(__dirname, dest)}（保留最近 7 份）`);
+      // WAL 回收：把 -wal 合并回主库文件并截断，避免 .db-wal 随写入无限膨胀占满磁盘
+      // （低峰期每日首次启动顺带执行一次，同步操作对单进程无实质影响）
+      try { db.pragma('wal_checkpoint(TRUNCATE)'); } catch (e) { console.log('[备份] WAL 回收失败（可忽略）：' + e.message); }
     }).catch(e => console.log('[备份] 自动备份失败：' + e.message));
   } catch (e) { console.log('[备份] 自动备份跳过：' + e.message); }
 }
