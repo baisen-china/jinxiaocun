@@ -10,7 +10,11 @@ const crypto = require('crypto');
 const express = require('express');
 const session = require('express-session');
 const bcrypt = require('bcryptjs');
-const db = require('./db');
+const Database = require('better-sqlite3');
+// 注意这里是 let 而不是 const：导入备份时要关掉旧连接、换掉数据库文件、重新加载这个模块，
+// 所有 handler 里写的都是 db.xxx，它们引用的是模块作用域的这个变量，所以换连接后自动指向新库。
+// 换连接的前提：不能把 prepared statement 缓存在模块作用域里（见下面 /health 的写法）。
+let db = require('./db');
 const { buildWorkbook } = require('./lib/xlsx');
 const { readTable } = require('./lib/xlsx-read');
 const REWARD = require('./lib/reward-qr');
@@ -51,15 +55,25 @@ app.use(session({
   cookie: { httpOnly: true, sameSite: 'lax', maxAge: 1000 * 60 * 60 * 24 * 7 }
 }));
 
+// 导入备份的那一两百毫秒里数据库连接是关着的，此时任何业务请求打进来都会报
+// 「connection is not open」，用户看到的是满屏报错、以为数据坏了。
+// 所以在最前面立一道闸：正在换库时，除「系统初始化/恢复」接口外一律 503，前端自己会重试。
+let systemBusy = false;
+app.use((req, res, next) => {
+  if (!systemBusy || req.path.startsWith('/api/system/')) return next();
+  res.status(503).json({ error: '正在导入数据，请稍候几秒再操作' });
+});
+
 // ---------- 健康检查 ----------
 // 供外部监控（Uptime Kuma / 云监控 / 反向代理探活）使用，**不鉴权**。
 // 刻意不返回任何业务数据（商品数、单据数、用户名都算敏感），只回答两件事：
 //   ① 进程还活着；② 数据库还能读（能读不出来说明文件被锁/被删/磁盘故障）。
 // 数据库不可读时返回 503 而不是 200——否则监控看到 200 会以为一切正常，问题被掩盖。
-const healthStmt = db.prepare('SELECT 1 AS ok');
+// 不缓存 prepared statement：导入备份会重建连接，缓存下来的语句会绑在已关闭的连接上，
+// 之后每次访问 /health 都报「connection is not open」，看起来像数据库坏了。
 app.get('/health', (req, res) => {
   let dbOk = false;
-  try { dbOk = healthStmt.get().ok === 1; } catch (e) { dbOk = false; }
+  try { dbOk = db.prepare('SELECT 1 AS ok').get().ok === 1; } catch (e) { dbOk = false; }
   res.status(dbOk ? 200 : 503).json({
     status: dbOk ? 'ok' : 'degraded',
     db: dbOk ? 'ok' : 'error',
@@ -737,6 +751,233 @@ function stampNow() {
   const p = (n) => String(n).padStart(2, '0');
   return `${d.getFullYear()}${p(d.getMonth() + 1)}${p(d.getDate())}-${p(d.getHours())}${p(d.getMinutes())}${p(d.getSeconds())}`;
 }
+
+// ---------- 系统初始化（每个安装只能做一次）/ 数据恢复 ----------
+// 「初始化」= 把系统清成一张白纸：业务数据全删、只留当前管理员、配置回默认。
+// 「数据恢复」= 导入「数据安全 · 备份」导出的 .db 文件，覆盖当前数据。
+// 两个操作都不可撤销，所以：
+//   ① 界面两次确认，第二次必须手打确认词；
+//   ② 服务端**再校验一次确认词**（绕过界面直接调接口也拦得住）；
+//   ③ 动作发生前先落一份快照，失败还能退回去。
+const SYSTEM_FLAG = path.join(DATA_DIR, '.initialized.json');
+const RESET_PHRASE = '清空数据';
+const RESTORE_PHRASE = '导入数据';
+
+// 「只能初始化一次」的标记存成文件，**不写进数据库**：
+// 初始化会清库，写库里会被自己删掉；导入旧备份也会把库里那份标记覆盖回去，等于又能重置一次。
+// 文件按安装（数据目录）算，换机器/换数据目录就是新安装，可以再初始化——这与直觉一致。
+function systemState() {
+  let f = null;
+  try { f = JSON.parse(fs.readFileSync(SYSTEM_FLAG, 'utf8')); } catch (e) { f = null; }
+  const ok = !!(f && f.at);
+  return {
+    initialized: ok,
+    at: ok ? f.at : null,
+    by: ok ? (f.by || '') : '',
+    backup: ok ? (f.backup || '') : ''
+  };
+}
+
+function dbFilePath() {
+  return process.env.INVENTORY_DB || path.join(__dirname, 'data', 'inventory.db');
+}
+function backupsDir() {
+  return path.join(path.dirname(dbFilePath()), 'backups');
+}
+
+// 当前数据量：初始化前展示给管理员看「你要删掉的是什么」，也是导入后的结果核对
+function countRows() {
+  const one = (t) => { try { return db.prepare(`SELECT COUNT(*) c FROM "${t}"`).get().c; } catch (e) { return 0; } };
+  return {
+    users: one('users'),
+    products: one('products'),
+    suppliers: one('suppliers'),
+    customers: one('customers'),
+    purchases: one('purchases'),
+    sales: one('sales'),
+    payments: one('payments'),
+    stockLogs: one('stock_logs'),
+    allocations: one('payment_allocations'),
+    lots: one('inventory_lots')
+  };
+}
+
+function stampYmd(d = new Date()) {
+  const p = (n) => String(n).padStart(2, '0');
+  return `${d.getFullYear()}${p(d.getMonth() + 1)}${p(d.getDate())}`;
+}
+
+// 生成「日期-序号-标签.db」快照，如 20261103-01-导入前备份.db。
+// 序号按「当天同标签已有文件」递增（01 起），一天导两次不会互相覆盖。
+// 用 db.backup() 而不是复制文件：WAL 模式下正在跑的服务直接拷 .db 可能拷到一半的页。
+async function snapshotWithTag(tag) {
+  const dir = backupsDir();
+  fs.mkdirSync(dir, { recursive: true });
+  const ymd = stampYmd();
+  const re = new RegExp('^' + ymd + '-(\\d+)-' + tag + '\\.db$');
+  let max = 0;
+  for (const f of fs.readdirSync(dir)) {
+    const m = re.exec(f);
+    if (m) max = Math.max(max, parseInt(m[1], 10) || 0);
+  }
+  const name = `${ymd}-${String(max + 1).padStart(2, '0')}-${tag}.db`;
+  await db.backup(path.join(dir, name));
+  return name;
+}
+
+// 校验上传的文件到底是不是「本系统的备份」：不通过就绝不碰现有数据。
+// 四个关卡：文件头（是不是 SQLite）→ 完整性（quick_check）→ 表结构（是不是本系统）→ 有没有管理员。
+function inspectBackup(buf) {
+  if (!buf || buf.length < 4096) return { ok: false, error: '文件太小，不像是本系统的数据库备份' };
+  if (buf.subarray(0, 16).toString('latin1') !== 'SQLite format 3\u0000') {
+    return { ok: false, error: '这不是 SQLite 数据库文件（可能选成了压缩包或其他文件）' };
+  }
+  const tmp = path.join(os.tmpdir(), `inv_restore_check_${Date.now()}.db`);
+  let src = null;
+  try {
+    fs.writeFileSync(tmp, buf);
+    src = new Database(tmp, { readonly: true, fileMustExist: true });
+    const quick = String(src.pragma('quick_check', { simple: true }) || '');
+    if (quick.toLowerCase() !== 'ok') {
+      return { ok: false, error: '备份文件完整性校验未通过（文件可能已损坏）：' + quick.slice(0, 200) };
+    }
+    const tables = new Set(src.prepare("SELECT name FROM sqlite_master WHERE type='table'").all().map((r) => r.name));
+    const need = ['users', 'products', 'suppliers', 'customers', 'purchases', 'purchase_items', 'sales', 'sale_items', 'payments', 'payment_allocations', 'meta'];
+    const missing = need.filter((t) => !tables.has(t));
+    if (missing.length) return { ok: false, error: '这份文件不是本系统的备份：缺少数据表 ' + missing.join('、') };
+    const admins = src.prepare("SELECT COUNT(*) c FROM users WHERE role = 'admin'").get().c;
+    if (!admins) return { ok: false, error: '备份里没有管理员账号，导入后将无法登录，已拒绝' };
+    const cnt = (t) => { try { return src.prepare(`SELECT COUNT(*) c FROM "${t}"`).get().c; } catch (e) { return 0; } };
+    return {
+      ok: true,
+      counts: {
+        users: cnt('users'), products: cnt('products'), suppliers: cnt('suppliers'), customers: cnt('customers'),
+        purchases: cnt('purchases'), sales: cnt('sales'), payments: cnt('payments')
+      }
+    };
+  } catch (e) {
+    return { ok: false, error: '读取备份失败：' + e.message };
+  } finally {
+    try { if (src) src.close(); } catch (e) { /* 已关闭 */ }
+    try { fs.unlinkSync(tmp); } catch (e) { /* 临时文件已不在 */ }
+  }
+}
+
+app.get('/api/system/state', requireAdmin, (req, res) => {
+  res.json({
+    ...systemState(),
+    counts: countRows(),
+    // 统一用正斜杠：Windows 下 path.relative 给的是 data\backups，界面上和后面的 /文件名 拼起来会很怪
+    backupsDir: (path.relative(__dirname, backupsDir()) || '.').replace(/\\/g, '/'),
+    phrases: { reset: RESET_PHRASE, restore: RESTORE_PHRASE }
+  });
+});
+
+// 清空全部数据并初始化系统
+app.post('/api/system/reset', requireAdmin, async (req, res) => {
+  if (systemState().initialized) {
+    return res.status(409).json({ error: '本系统已经初始化过，这个按钮只能用一次（如需回到空白状态，请导入一份空备份）' });
+  }
+  const phrase = String((req.body && req.body.phrase) || '').trim();
+  if (phrase !== RESET_PHRASE) {
+    return res.status(400).json({ error: `初始化需要二次确认：请完整输入「${RESET_PHRASE}」` });
+  }
+  const before = countRows();
+  // 先备份再动刀：备份失败就中止，绝不在没有退路的情况下清库
+  let snapshot;
+  try { snapshot = await snapshotWithTag('初始化前备份'); }
+  catch (e) { return res.status(500).json({ error: '初始化前的自动备份失败，已中止：' + e.message }); }
+
+  // 删除顺序无所谓：事务里用 defer_foreign_keys 把外键检查推迟到提交时，
+  // 否则删到中间（比如先删了 suppliers、purchases 还没删）会因外键约束直接失败。
+  const TABLES = ['payment_adjustments', 'payment_deletions', 'payment_allocations', 'payments',
+    'sale_items', 'sales', 'purchase_items', 'purchases', 'inventory_lots', 'stock_logs',
+    'doc_voids', 'price_logs', 'products', 'customers', 'suppliers'];
+  try {
+    const tx = db.transaction(() => {
+      db.pragma('defer_foreign_keys = ON');
+      for (const t of TABLES) db.prepare(`DELETE FROM "${t}"`).run();
+      // 只留当前这个管理员：否则清完库谁都没法登录，系统就废了
+      db.prepare('DELETE FROM users WHERE id <> ?').run(req.session.userId);
+      // 配置回默认（品牌名、欢迎语、权限、音乐、广播……）
+      db.prepare("DELETE FROM meta WHERE key = 'ui_settings'").run();
+      // 自增 id 归零：新系统从 1 号开始，看着才像刚装好的
+      try { db.prepare('DELETE FROM sqlite_sequence').run(); } catch (e) { /* 没有该表就算了 */ }
+    });
+    tx();
+  } catch (e) {
+    return res.status(500).json({ error: '初始化失败：' + e.message + `（初始化前备份：${snapshot}）` });
+  }
+
+  let warn = '';
+  try {
+    const me = db.prepare('SELECT username FROM users WHERE id = ?').get(req.session.userId);
+    fs.writeFileSync(SYSTEM_FLAG, JSON.stringify({ at: nowLocal(), by: (me && me.username) || 'admin', backup: snapshot }, null, 2));
+  } catch (e) {
+    // 数据已经清了，只是「已初始化」标记没写进去。必须明确告诉管理员，否则他能再点一次。
+    warn = '数据已清空，但「已初始化」标记写入失败：' + e.message + '（重启后仍可再次初始化，请检查数据目录权限）';
+    console.error('[系统初始化] ' + warn);
+  }
+  res.json({ ok: true, backup: snapshot, cleared: before, after: countRows(), warn });
+});
+
+// 导入「数据安全 · 备份」导出的数据库文件，覆盖当前数据
+app.post('/api/system/restore', requireAdmin, express.raw({ type: () => true, limit: '512mb' }), async (req, res) => {
+  if (!systemState().initialized) {
+    return res.status(409).json({ error: '请先完成系统初始化，之后才能使用数据恢复' });
+  }
+  // 确认词走查询参数而不是请求头：HTTP 头只能放 ASCII，中文会被浏览器/代理截断或直接报错，
+  // 结果就是「界面输入对了、服务端收到的却是空」。查询参数是 percent-encoded，中文没问题。
+  if (String(req.query.phrase || '').trim() !== RESTORE_PHRASE) {
+    return res.status(400).json({ error: `导入需要二次确认：请完整输入「${RESTORE_PHRASE}」` });
+  }
+  const buf = Buffer.isBuffer(req.body) ? req.body : Buffer.alloc(0);
+  if (!buf.length) return res.status(400).json({ error: '没有收到备份文件' });
+
+  const check = inspectBackup(buf);
+  if (!check.ok) return res.status(400).json({ error: check.error });
+
+  let snapshot;
+  try { snapshot = await snapshotWithTag('导入前备份'); }
+  catch (e) { return res.status(500).json({ error: '导入前的自动备份失败，已中止：' + e.message }); }
+
+  const target = dbFilePath();
+  const tmp = target + '.import-tmp';
+  const snapshotPath = path.join(backupsDir(), snapshot);
+  fs.writeFileSync(tmp, buf);
+
+  systemBusy = true;   // 换库期间拒绝其它请求（见文件顶部那道闸）
+  try {
+    try { db.close(); } catch (e) { /* 已经关了 */ }
+    // 必须先清 WAL/SHM：旧库的日志文件如果留着，SQLite 打开新文件时会拿旧日志去覆盖，
+    // 结果就是「导入成功但数据还是老的」，非常难排查。
+    for (const suf of ['-wal', '-shm']) { try { fs.unlinkSync(target + suf); } catch (e) { /* 本来就没有 */ } }
+    try { fs.renameSync(tmp, target); }
+    catch (e) { fs.copyFileSync(tmp, target); try { fs.unlinkSync(tmp); } catch (e2) { /* 忽略 */ } }
+    delete require.cache[require.resolve('./db')];
+    db = require('./db');   // 重新打开还原后的库，迁移/建表逻辑随之在新库上跑一遍
+    if (!db.prepare('SELECT COUNT(*) c FROM users').get().c) throw new Error('导入后的数据库里没有任何用户');
+  } catch (e) {
+    // 兜底：把「导入前备份」塞回去，保证系统至少还能用
+    let rollback = '';
+    try {
+      try { db.close(); } catch (e2) { /* 已关 */ }
+      for (const suf of ['-wal', '-shm']) { try { fs.unlinkSync(target + suf); } catch (e2) { /* 没有 */ } }
+      fs.copyFileSync(snapshotPath, target);
+      delete require.cache[require.resolve('./db')];
+      db = require('./db');
+      rollback = '，已自动回滚到导入前的数据';
+    } catch (e2) {
+      rollback = '，回滚也失败了（' + e2.message + '），请手工把 ' + path.relative(__dirname, snapshotPath) + ' 改名为 inventory.db 后重启';
+    }
+    try { fs.unlinkSync(tmp); } catch (e2) { /* 忽略 */ }
+    systemBusy = false;
+    return res.status(500).json({ error: '导入失败：' + e.message + rollback + `（导入前备份：${snapshot}）` });
+  }
+  systemBusy = false;
+  res.json({ ok: true, backup: snapshot, counts: countRows(), from: check.counts });
+});
+
 app.get('/api/backup', requireAdmin, async (req, res) => {
   const tmp = path.join(os.tmpdir(), `inv_backup_${Date.now()}.db`);
   try {

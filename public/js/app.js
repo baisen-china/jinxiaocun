@@ -94,6 +94,63 @@
 
   const TITLES = { dashboard: '仪表盘', products: '商品管理', purchase: '采购入库', sale: '销售出库', inventory: '库存管理', finance: '收付款', suppliers: '供应商', customers: '客户', reports: '报表', users: '用户管理', settings: '系统配置' };
 
+  // 不可撤销操作的两步确认：第一步把后果摊开讲清楚，第二步必须**手打确认词**才算数。
+  // 服务端也会校验同一个确认词，所以绕过界面直接敲接口同样拦得住。
+  // 返回 Promise<boolean>：两步都确认了才是 true。
+  function dangerConfirm(opt) {
+    return new Promise((resolve) => {
+      let done = false;
+      const finish = (v) => { if (!done) { done = true; resolve(v); } };
+      const maskClose = (m) => {
+        const mask = m.root.querySelector('.modal-mask');
+        if (mask) mask.addEventListener('click', (e) => { if (e.target === mask) finish(false); });
+      };
+      const m1 = modal(`<div class="modal-head">
+          <div class="avatar">⚠️</div>
+          <div><div class="mt">${esc(opt.title)}</div><div class="ms">${esc(opt.intro || '此操作不可撤销')}</div></div>
+        </div>
+        <ul class="due-list">${(opt.bullets || []).map((t) => `<li>${t}</li>`).join('')}</ul>
+        <div class="form-note">${opt.note || ''}</div>
+        <div class="modal-actions">
+          <button type="button" class="btn-ghost" id="dc-cancel">取消</button>
+          <button type="button" class="btn-danger" id="dc-next">我已了解，继续</button>
+        </div>`, 'modal-confirm');
+      maskClose(m1);
+      m1.root.querySelector('#dc-cancel').onclick = () => { m1.close(); finish(false); };
+      m1.root.querySelector('#dc-next').onclick = () => {
+        m1.close();
+        const m2 = modal(`<div class="modal-head">
+            <div class="avatar">🔒</div>
+            <div><div class="mt">再确认一次</div><div class="ms">这是第二次确认，点下去立即执行，无法撤销</div></div>
+          </div>
+          <div class="field">
+            <label>请输入「<b>${esc(opt.phrase)}</b>」以继续</label>
+            <input id="dc-phrase" autocomplete="off" spellcheck="false" placeholder="${esc(opt.phrase)}">
+            <div class="field-hint">必须完全一致，用来防止手滑</div>
+          </div>
+          <div class="modal-actions">
+            <button type="button" class="btn-ghost" id="dc-back">取消</button>
+            <button type="button" class="btn-danger" id="dc-ok" disabled>${esc(opt.okText || '确认执行')}</button>
+          </div>`, 'modal-confirm');
+        const inp = m2.root.querySelector('#dc-phrase');
+        const okBtn = m2.root.querySelector('#dc-ok');
+        const sync = () => { okBtn.disabled = inp.value.trim() !== opt.phrase; };
+        inp.addEventListener('input', sync);
+        inp.addEventListener('keydown', (e) => { if (e.key === 'Enter' && !okBtn.disabled) okBtn.click(); });
+        setTimeout(() => inp.focus(), 30);
+        maskClose(m2);
+        m2.root.querySelector('#dc-back').onclick = () => { m2.close(); finish(false); };
+        okBtn.onclick = () => { m2.close(); finish(true); };
+      };
+    });
+  }
+
+  // 本地日期 yyyymmdd：只用于在界面上示意备份文件名（真实文件名以服务端返回为准）
+  function todayYmd() {
+    const d = new Date(); const p = (n) => String(n).padStart(2, '0');
+    return `${d.getFullYear()}${p(d.getMonth() + 1)}${p(d.getDate())}`;
+  }
+
   // ---------- 品牌（商店名称 / 欢迎语）----------
   function brand() {
     const b = state.branding || {};
@@ -999,6 +1056,10 @@
           <span class="field-hint" id="hc-hint"></span>
         </div>
         <div id="hc-result" style="margin-top:12px"></div>
+      </div>
+      <div class="card" style="margin-top:16px">
+        <div class="card-title">系统初始化 · 数据恢复 <span class="tag gray" id="sys-tag">读取中…</span></div>
+        <div id="sys-body"><p class="settings-desc">正在读取系统状态…</p></div>
       </div>` : ''}
       <div class="modal-actions" style="justify-content:flex-start;margin-top:20px">
         <button class="btn-primary" id="save-settings">保存配置</button>
@@ -1087,6 +1148,128 @@
           } catch (e) { toast(e.message, true); } finally { save.disabled = false; }
         };
       }
+    })();
+    // 系统初始化（一次性）/ 数据恢复：两者都改全库、不可撤销，统一走 dangerConfirm 的两步确认
+    (async () => {
+      const box = $('#sys-body'), tag = $('#sys-tag');
+      if (!box) return;
+      let st;
+      try { st = await api('GET', '/api/system/state'); }
+      catch (e) {
+        if (tag) { tag.className = 'tag warn'; tag.textContent = '读取失败'; }
+        box.innerHTML = `<p class="settings-desc">读取系统状态失败：${esc(e.message)}</p>`;
+        return;
+      }
+      const c = st.counts || {};
+      const cnt = (n) => intf(n || 0);
+      const bakDir = st.backupsDir || 'data/backups';
+
+      if (!st.initialized) {
+        if (tag) { tag.className = 'tag warn'; tag.textContent = '未初始化'; }
+        box.innerHTML = `
+          <p class="settings-desc">第一次使用时，可以在这里把系统清成一张白纸：删除全部商品、供应商、客户、单据、收付款与库存流水，只保留<b>当前登录的管理员账号</b>，配置恢复默认（商店名称回到「天下第一家」）。<br>
+          <b>这个按钮每个安装只能用一次</b>；初始化之后本位置会出现「数据恢复」，可把以前用「数据安全 · 备份」导出的数据导回来。</p>
+          <div class="field-hint" style="line-height:1.9">
+            当前数据：商品 <b>${cnt(c.products)}</b> · 供应商 <b>${cnt(c.suppliers)}</b> · 客户 <b>${cnt(c.customers)}</b> ·
+            采购单 <b>${cnt(c.purchases)}</b> · 销售单 <b>${cnt(c.sales)}</b> · 收付款 <b>${cnt(c.payments)}</b> · 库存流水 <b>${cnt(c.stockLogs)}</b> · 账号 <b>${cnt(c.users)}</b>
+          </div>
+          <div class="bak-row" style="margin-top:12px">
+            <button type="button" class="btn-danger" id="sys-reset">清空全部数据并初始化</button>
+            <span class="field-hint">执行前自动备份到 <code>${esc(bakDir)}</code>，文件名形如 <code>${todayYmd()}-01-初始化前备份.db</code></span>
+          </div>`;
+        const btn = $('#sys-reset');
+        btn.onclick = async () => {
+          const ok = await dangerConfirm({
+            title: '清空全部数据并初始化系统',
+            intro: '当前系统里的业务数据会被全部删除，不可撤销',
+            bullets: [
+              `商品 <b>${cnt(c.products)}</b> 个、供应商 <b>${cnt(c.suppliers)}</b> 家、客户 <b>${cnt(c.customers)}</b> 家`,
+              `采购单 <b>${cnt(c.purchases)}</b> 张、销售单 <b>${cnt(c.sales)}</b> 张、收付款 <b>${cnt(c.payments)}</b> 笔、库存流水 <b>${cnt(c.stockLogs)}</b> 条`,
+              `其余账号（共 <b>${cnt(c.users)}</b> 个）会被删除，只保留当前登录的管理员`,
+              '商店名称、欢迎语、播放器开关等配置恢复默认'
+            ],
+            note: `执行前会自动备份一份到 <code>${esc(bakDir)}</code>（<code>${todayYmd()}-01-初始化前备份.db</code>）。<br>
+              <span class="muted">这个按钮只能用一次。导错/清错时，初始化后可用「数据恢复」把备份导回来。</span>`,
+            phrase: st.phrases.reset,
+            okText: '确认清空并初始化'
+          });
+          if (!ok) return;
+          btn.disabled = true; btn.textContent = '正在初始化…';
+          try {
+            const r = await api('POST', '/api/system/reset', { phrase: st.phrases.reset });
+            toast(`已初始化，初始化前备份：${r.backup}`);
+            if (r.warn) setTimeout(() => toast(r.warn, true), 2400);
+            setTimeout(() => location.reload(), 2200);
+          } catch (e) {
+            toast(e.message, true);
+            btn.disabled = false; btn.textContent = '清空全部数据并初始化';
+          }
+        };
+        return;
+      }
+
+      // 已初始化 → 提供数据恢复（导入「数据安全 · 备份」导出的 .db）
+      if (tag) { tag.className = 'tag ok'; tag.textContent = '已初始化'; }
+      box.innerHTML = `
+        <p class="settings-desc">系统已于 <b>${esc(st.at || '')}</b>${st.by ? `（${esc(st.by)}）` : ''} 完成初始化。要恢复以前的账目，选择当时用「数据安全 · 备份」导出的 <code>.db</code> 文件导入，导入后会<b>覆盖</b>当前全部数据。</p>
+        <div class="form-row">
+          <div class="field">
+            <label>选择备份文件</label>
+            <input type="file" id="sys-file" accept=".db,.sqlite,.sqlite3,application/octet-stream">
+            <div class="field-hint" id="sys-file-hint">只接受本系统导出的备份，导入前会自动校验文件头、完整性与表结构</div>
+          </div>
+          <div class="field">
+            <label>&nbsp;</label>
+            <button type="button" class="btn-warn" id="sys-restore" disabled>导入并覆盖当前数据</button>
+          </div>
+        </div>
+        <div class="field-hint" style="margin-top:10px;line-height:1.9">
+          导入前会把当前数据备份成 <code>${esc(bakDir)}/${todayYmd()}-01-导入前备份.db</code>（同一天多次导入序号递增 02、03…）；<br>
+          当前数据：商品 <b>${cnt(c.products)}</b> · 采购单 <b>${cnt(c.purchases)}</b> · 销售单 <b>${cnt(c.sales)}</b> · 收付款 <b>${cnt(c.payments)}</b> · 账号 <b>${cnt(c.users)}</b>。
+        </div>`;
+      const file = $('#sys-file'), rbtn = $('#sys-restore'), hint = $('#sys-file-hint');
+      file.onchange = () => {
+        const f = file.files && file.files[0];
+        if (!f) { hint.textContent = '只接受本系统导出的备份，导入前会自动校验文件头、完整性与表结构'; rbtn.disabled = true; return; }
+        hint.innerHTML = `已选择 <b>${esc(f.name)}</b>（${(f.size / 1048576).toFixed(2)} MB）`;
+        rbtn.disabled = false;
+      };
+      rbtn.onclick = async () => {
+        const f = file.files && file.files[0];
+        if (!f) return toast('请先选择备份文件', true);
+        const ok = await dangerConfirm({
+          title: '导入备份并覆盖当前数据',
+          intro: '导入后，当前系统里的数据会被这份备份完全替换',
+          bullets: [
+            `文件：<b>${esc(f.name)}</b>（${(f.size / 1048576).toFixed(2)} MB）`,
+            '当前全部商品、单据、收付款、客户供应商都会被覆盖',
+            '账号也会换成备份里的账号，可能需要重新登录',
+            '导入前会自动备份当前数据，导错了还能换回来'
+          ],
+          note: '导入过程约几秒，期间其它页面的操作会暂时失败，稍等即可。<br><span class="muted">只能导入本系统导出的 .db 备份；文件头、完整性、表结构、管理员账号都会先校验，不合格不会动现有数据。</span>',
+          phrase: st.phrases.restore,
+          okText: '确认导入并覆盖'
+        });
+        if (!ok) return;
+        rbtn.disabled = true; rbtn.textContent = '导入中…';
+        try {
+          // 直接传文件字节（不走 api()，那里统一发 JSON）。
+          // 确认词放查询参数：HTTP 头只允许 ASCII，中文放头里会被丢掉。
+          const res = await fetch(`/api/system/restore?phrase=${encodeURIComponent(st.phrases.restore)}`, {
+            method: 'POST',
+            credentials: 'same-origin',
+            headers: { 'Content-Type': 'application/octet-stream' },
+            body: f
+          });
+          const data = await res.json().catch(() => ({}));
+          if (!res.ok) throw new Error(data.error || `导入失败（HTTP ${res.status}）`);
+          toast(`导入完成，导入前备份：${data.backup}`);
+          setTimeout(() => location.reload(), 2400);
+        } catch (e) {
+          toast(e.message, true);
+          rbtn.disabled = false; rbtn.textContent = '导入并覆盖当前数据';
+        }
+      };
     })();
     $('#bd-preview').onclick = () => {
       const t = $('#bd-welcome').value.trim();
