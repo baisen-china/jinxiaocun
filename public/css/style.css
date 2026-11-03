@@ -420,6 +420,19 @@ td.num.up, td.num.down { font-size: 13px; font-weight: 600; }
 .bak-row .field-hint { margin: 0; }
 .settings-desc code { background: rgba(17,24,39,.06); padding: 1px 5px; border-radius: 4px; font-size: 12px; }
 
+/* 配置页 · 打赏二维码 */
+.reward-box { display: flex; align-items: flex-start; gap: 20px; flex-wrap: wrap; }
+.reward-qr { flex: none; width: 240px; padding: 10px; border: 1px solid var(--border); border-radius: 12px; background: #fff; }
+/* 二维码必须保持正方形比例：拉伸会让扫码识别率骤降，所以只定宽、高度自动 */
+.reward-qr img { display: block; width: 100%; height: auto; }
+.reward-qr .field-hint { margin: 8px 0 0; }
+.reward-meta { flex: 1; min-width: 240px; display: flex; flex-direction: column; gap: 6px; }
+.reward-meta .field-hint { margin: 0; line-height: 1.7; }
+/* 按钮不要被 flex 拉伸成整行——那样看起来像个输入框，不像按钮 */
+.reward-meta .btn-ghost { align-self: flex-start; }
+.reward-meta code { background: rgba(17,24,39,.06); padding: 1px 5px; border-radius: 4px; font-size: 12px; }
+.reward-warn { color: var(--warn); }
+
 /* 仪表盘 · 待办提醒 */
 .todo-card { margin-bottom: 16px; border-left: 3px solid var(--warn, #f59e0b); }
 .todo-list { display: flex; flex-direction: column; gap: 8px; }

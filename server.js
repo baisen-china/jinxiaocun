@@ -13,6 +13,7 @@ const bcrypt = require('bcryptjs');
 const db = require('./db');
 const { buildWorkbook } = require('./lib/xlsx');
 const { readTable } = require('./lib/xlsx-read');
+const REWARD = require('./lib/reward-qr');
 
 const app = express();
 const PORT = process.env.PORT || 3000;
@@ -669,6 +670,64 @@ app.get('/api/broadcast/audio', requireAuth, (req, res) => {
   res.sendFile(path.join(BROADCAST_DIR, hit.name), (err) => {
     if (err && !res.headersSent) res.status(404).end();
   });
+});
+
+// ---------- 打赏二维码（图片内置，防替换） ----------
+// 图片字节写死在 lib/reward-qr.js 里，运行时**不读磁盘**。原因见该文件顶部：
+// 打赏收款码是「钱的去向」，做成磁盘图片（public/ 静态文件或根目录 jpg）就意味着
+// 任何能碰到这台机器文件的人换一张图，顾客扫的钱就换了主人，而界面上看不出异常。
+// 内置之后：换掉项目里的 打赏码.jpg 只影响「存档」，展示的仍是作者本人那张。
+// 启动时核对一次摘要：万一有人连内置 base64 一起改、或生成脚本跑坏了，
+// 宁可没有二维码，也不能把一个来路不明的收款码推给用户。
+const REWARD_QR_OK = REWARD.DIGEST === REWARD.EXPECTED_SHA256;
+if (!REWARD_QR_OK) {
+  console.error('[打赏二维码] 内置数据校验失败：实际 ' + REWARD.DIGEST + '，预期 ' + REWARD.EXPECTED_SHA256);
+  console.error('[打赏二维码] 已停止对外提供二维码。若是主动更换收款码，请改图后重新执行 node scripts/gen-reward-qr.js');
+}
+
+// 源图片（目录里那张 jpg）当前状态：只用于在界面上提示「有没有被人换过」，不参与渲染。
+// 这张图现在是「存档」——就算被换成别人的收款码，页面展示的仍是内置的那张。
+function rewardSourceState() {
+  const out = { name: REWARD.SOURCE_FILE, present: false, matches: false, changedAt: null };
+  try {
+    const file = path.join(__dirname, REWARD.SOURCE_FILE);
+    const st = fs.statSync(file);
+    if (!st.isFile()) return out;
+    out.present = true;
+    out.changedAt = new Date(st.mtimeMs).toLocaleString('zh-CN', { hour12: false });
+    const digest = crypto.createHash('sha256').update(fs.readFileSync(file)).digest('hex');
+    out.matches = digest === REWARD.EXPECTED_SHA256;
+  } catch (e) { /* 文件不在属正常：内置数据照样可用 */ }
+  return out;
+}
+
+app.get('/api/reward/info', requireAuth, (req, res) => {
+  res.json({
+    available: REWARD_QR_OK,
+    url: '/api/reward/qr',
+    digest: REWARD.DIGEST,
+    short: REWARD.DIGEST.slice(0, 12).toUpperCase(),
+    size: REWARD.SIZE,
+    width: REWARD.WIDTH,
+    height: REWARD.HEIGHT,
+    mime: REWARD.MIME,
+    source: rewardSourceState()
+  });
+});
+
+// 二维码本体：直接从内存里的字节返回，没有任何文件路径参数可传（不给路径穿越留口子）。
+// no-store：不让浏览器/代理缓存旧图——换了收款码后必须立刻生效。
+app.get('/api/reward/qr', requireAuth, (req, res) => {
+  if (!REWARD_QR_OK) return res.status(503).json({ error: '打赏二维码内置数据校验失败，已停止提供' });
+  res.set({
+    'Content-Type': REWARD.MIME,
+    'Content-Length': String(REWARD.SIZE),
+    'Cache-Control': 'no-store, no-cache, must-revalidate, max-age=0',
+    Pragma: 'no-cache',
+    'X-QR-Digest': REWARD.DIGEST,
+    'Content-Disposition': 'inline; filename="reward-qr.' + (REWARD.MIME === 'image/png' ? 'png' : 'jpg') + '"'
+  });
+  res.send(REWARD.DATA);
 });
 
 // 一键备份：把当前数据库热备份成一个 .db 文件直接下载（WAL 模式下也能保证一致性快照）

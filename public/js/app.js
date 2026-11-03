@@ -1003,7 +1003,23 @@
       <div class="modal-actions" style="justify-content:flex-start;margin-top:20px">
         <button class="btn-primary" id="save-settings">保存配置</button>
       </div>
-      <p class="settings-desc" style="margin-top:12px">提示：销售额统计口径为「销售出库单金额合计」，与报表一致；退单待审的单据仍计入，已确认退单的不计入。品牌、动画与权限设置保存后立即生效；开机动画的停留时长在下次打开或刷新页面时按新设置播放。</p>`;
+      <p class="settings-desc" style="margin-top:12px">提示：销售额统计口径为「销售出库单金额合计」，与报表一致；退单待审的单据仍计入，已确认退单的不计入。品牌、动画与权限设置保存后立即生效；开机动画的停留时长在下次打开或刷新页面时按新设置播放。</p>
+      <div class="card" style="margin-top:16px">
+        <div class="card-title">☕ 打赏支持 <span class="tag gray" id="rw-tag">校验中…</span></div>
+        <p class="settings-desc" style="margin-bottom:12px">这套进销存用得顺手、帮你省了事？可以扫下面这个码打赏一下，金额随意，全凭心意。<br>
+        这个二维码是<b>内置在程序里</b>的，不是读取目录中的图片文件——所以即使有人把 <code>打赏码.jpg</code> 换成自己的收款码，这里显示、你扫的仍然是同一张正版二维码。</p>
+        <div class="reward-box">
+          <div class="reward-qr">
+            <img id="rw-img" alt="打赏二维码" hidden>
+            <div class="field-hint" style="text-align:center">微信扫码 · 金额随意</div>
+          </div>
+          <div class="reward-meta">
+            <div class="field-hint">二维码指纹（SHA-256 前 12 位）：<code id="rw-digest">—</code></div>
+            <div class="field-hint" id="rw-src">正在核对…</div>
+            <button type="button" class="btn-ghost small" id="rw-save" style="margin-top:12px">⬇ 保存二维码图片</button>
+          </div>
+        </div>
+      </div>`;
     // 广播文件检测：让管理员一眼看到有哪些 guangbo-*.mp3、将按什么顺序轮播
     (async () => {
       const hint = $('#bc-file-hint');
@@ -1021,6 +1037,56 @@
           hint.innerHTML = `✅ 已识别 ${list.length} 个文件，一轮共 ${play.length} 条，播放顺序：${shown}${play.length > 12 ? ` …（后面还有 ${play.length - 12} 条）` : ''}`;
         }
       } catch (e) { hint.textContent = '广播文件状态读取失败'; }
+    })();
+    // 打赏二维码：图片由服务端「内置字节」直接返回（不读磁盘），这里只负责把校验结果摊开给用户看。
+    // 展示指纹不只是好看——万一哪天截图里的二维码和指纹对不上，能立刻发现。
+    (async () => {
+      const img = $('#rw-img');
+      if (!img) return;
+      const tag = $('#rw-tag'), dg = $('#rw-digest'), srcEl = $('#rw-src'), save = $('#rw-save');
+      const mark = (cls, text, title) => { if (tag) { tag.className = 'tag ' + cls; tag.textContent = text; tag.title = title || ''; } };
+      let info;
+      try { info = await api('GET', '/api/reward/info'); }
+      catch (e) {
+        mark('warn', '读取失败');
+        if (srcEl) srcEl.textContent = '读取二维码状态失败：' + e.message;
+        return;
+      }
+      if (!info.available) {
+        mark('warn', '数据校验失败', '内置二维码数据的摘要与预期不符');
+        if (srcEl) srcEl.textContent = '内置二维码数据校验没通过，已停止展示（防止被换成他人收款码）。请重新执行 node scripts/gen-reward-qr.js 生成后再启动服务。';
+        if (save) save.disabled = true;
+        return;
+      }
+      mark('ok', '已校验', '内置数据摘要与预期一致');
+      if (dg) { dg.textContent = info.short; dg.title = info.digest; }
+      // 查询串带摘要：真换了收款码时 URL 会变，浏览器不会拿旧缓存顶上（服务端也已 no-store）
+      img.src = info.url + '?v=' + info.digest.slice(0, 12);
+      img.onload = () => { img.hidden = false; };
+      img.onerror = () => { mark('warn', '图片加载失败'); };
+      // 存档图片（目录里那张 jpg）只在被换掉时给出提示：它已经不参与渲染了，换不换都不影响收款
+      if (srcEl) {
+        const s = info.source || {};
+        const nm = esc(s.name || '打赏码.jpg');
+        if (!s.present) srcEl.innerHTML = `存档图片 <code>${nm}</code> 不在项目目录——不影响使用，展示的是内置数据`;
+        else if (s.matches) srcEl.innerHTML = `存档图片 <code>${nm}</code> 与内置数据一致（${esc(s.changedAt || '')}）`;
+        else srcEl.innerHTML = `<span class="reward-warn">⚠️ 目录里的 <code>${nm}</code> 已被改动或替换（${esc(s.changedAt || '')}），但本页展示的仍是内置的正版二维码，打赏不会打到别人账上。</span>`;
+      }
+      if (save) {
+        save.onclick = async () => {
+          save.disabled = true;
+          try {
+            const res = await fetch(info.url, { credentials: 'same-origin' });
+            if (!res.ok) throw new Error(`下载失败（HTTP ${res.status}）`);
+            const blob = await res.blob();
+            const url = URL.createObjectURL(blob);
+            const a = document.createElement('a');
+            a.href = url; a.download = '打赏二维码.jpg';
+            document.body.appendChild(a); a.click(); a.remove();
+            setTimeout(() => URL.revokeObjectURL(url), 5000);
+          } catch (e) { toast(e.message, true); } finally { save.disabled = false; }
+        };
+      }
     })();
     $('#bd-preview').onclick = () => {
       const t = $('#bd-welcome').value.trim();
