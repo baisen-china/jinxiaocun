@@ -5062,25 +5062,66 @@ app.use((err, req, res, next) => {
   res.status(500).json({ error: `服务器内部错误（已记录日志 ${at}），请把该时间告知管理员` });
 });
 
-// 每天首次启动自动备份一份到 data/backups，只保留最近 7 份（不阻塞启动）
-function autoBackupDaily() {
+// 每日定时自动备份：每天 1:00 主备一次；若当天 1:00 没备上（如服务器当时关机/未重启），
+// 则当天 15:00 再补一次。用两个自调度定时器实现，保证「常年不重启」也能持续备份。
+// 只保留最近 7 份；备份为异步，不阻塞启动、不阻塞主流程。
+let lastBackupDate = ''; // YYYYMMDD，避免当天 15:00 兜底时重复备份
+
+function doDailyBackup() {
+  return new Promise((resolve) => {
+    try {
+      const dbFile = process.env.INVENTORY_DB || path.join(__dirname, 'data', 'inventory.db');
+      const dir = path.join(path.dirname(dbFile), 'backups');
+      fs.mkdirSync(dir, { recursive: true });
+      const list = () => fs.readdirSync(dir).filter(f => /^auto-.*\.db$/.test(f)).sort();
+      const today = stampNow().slice(0, 8);
+      const dest = path.join(dir, `auto-${stampNow()}.db`);
+      db.backup(dest).then(() => {
+        // 保留最近 7 份
+        const all = list();
+        all.slice(0, Math.max(0, all.length - 7)).forEach(f => { try { fs.unlinkSync(path.join(dir, f)); } catch (e) {} });
+        console.log(`[备份] 已自动备份数据库：${path.relative(__dirname, dest)}（保留最近 7 份）`);
+        // WAL 回收：把 -wal 合并回主库文件并截断，避免 .db-wal 随写入无限膨胀占满磁盘
+        // （低峰期每天备份时顺带执行一次，同步操作对单进程无实质影响）
+        try { db.pragma('wal_checkpoint(TRUNCATE)'); } catch (e) { console.log('[备份] WAL 回收失败（可忽略）：' + e.message); }
+        lastBackupDate = today;
+        resolve(true);
+      }).catch(e => { console.log('[备份] 自动备份失败：' + e.message); resolve(false); });
+    } catch (e) { console.log('[备份] 自动备份跳过：' + e.message); resolve(false); }
+  });
+}
+
+function scheduleDailyBackup() {
+  const dir = path.join(path.dirname(process.env.INVENTORY_DB || path.join(__dirname, 'data', 'inventory.db')), 'backups');
+  try { fs.mkdirSync(dir, { recursive: true }); } catch (e) {}
+  // 启动时用「今天是否已有自动备份」初始化 lastBackupDate，避免当天 15:00 兜底重复备
   try {
-    const dbFile = process.env.INVENTORY_DB || path.join(__dirname, 'data', 'inventory.db');
-    const dir = path.join(path.dirname(dbFile), 'backups');
-    fs.mkdirSync(dir, { recursive: true });
-    const list = () => fs.readdirSync(dir).filter(f => /^auto-.*\.db$/.test(f)).sort();
     const today = stampNow().slice(0, 8);
-    if (list().some(f => f.includes(today))) return;
-    const dest = path.join(dir, `auto-${stampNow()}.db`);
-    db.backup(dest).then(() => {
-      const all = list();
-      all.slice(0, Math.max(0, all.length - 7)).forEach(f => { try { fs.unlinkSync(path.join(dir, f)); } catch (e) {} });
-      console.log(`[备份] 已自动备份数据库：${path.relative(__dirname, dest)}（保留最近 7 份）`);
-      // WAL 回收：把 -wal 合并回主库文件并截断，避免 .db-wal 随写入无限膨胀占满磁盘
-      // （低峰期每日首次启动顺带执行一次，同步操作对单进程无实质影响）
-      try { db.pragma('wal_checkpoint(TRUNCATE)'); } catch (e) { console.log('[备份] WAL 回收失败（可忽略）：' + e.message); }
-    }).catch(e => console.log('[备份] 自动备份失败：' + e.message));
-  } catch (e) { console.log('[备份] 自动备份跳过：' + e.message); }
+    const files = fs.readdirSync(dir).filter(f => /^auto-.*\.db$/.test(f));
+    if (files.some(f => f.includes(today))) lastBackupDate = today;
+  } catch (e) {}
+
+  // 下一个指定小时的触发点：若今天该时刻已过，则排到明天同一时刻
+  const nextAtHour = (h) => {
+    const now = new Date();
+    const next = new Date(now.getFullYear(), now.getMonth(), now.getDate(), h, 0, 0, 0);
+    if (next.getTime() <= now.getTime()) next.setDate(next.getDate() + 1);
+    return next;
+  };
+
+  // 自调度：到点触发一次，无论成功与否都重新排下一次；guardToday=true 表示「仅当天尚未备份才备」
+  function scheduleOnce(hour, guardToday) {
+    const fire = () => {
+      const today = stampNow().slice(0, 8);
+      const need = !guardToday || lastBackupDate !== today; // 15:00 兜底：当天 1:00 没备才备
+      const cont = () => scheduleOnce(hour, guardToday);
+      if (need) doDailyBackup().finally(cont); else cont();
+    };
+    setTimeout(fire, nextAtHour(hour).getTime() - Date.now());
+  }
+
+  scheduleOnce(1, false);   // 每天 1:00 主备
+  scheduleOnce(15, true);   // 每天 15:00 兜底（仅当天 1:00 没备上才备）
 }
 
 // 一次性数据修复（幂等，靠 meta 标记）：历史退单释回的钱一直躺在预存里，没有冲抵该单位当时的欠款，
@@ -5151,7 +5192,7 @@ const server = app.listen(PORT, HOST, () => {
   console.log(`${brand.shopName}专用进销存 服务已启动：http://${HOST}:${PORT}`);
   console.log(`本机访问：http://127.0.0.1:${PORT}`);
   console.log('注意：本系统为单进程设计（SQLite 单写者 + 内存会话），请勿用 PM2 cluster 等多实例方式部署。');
-  autoBackupDaily();
+  scheduleDailyBackup();
 });
 
 // 端口被占用时友好提示，而不是崩溃报红
